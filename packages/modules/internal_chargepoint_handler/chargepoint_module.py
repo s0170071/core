@@ -12,6 +12,7 @@ from modules.common.component_state import ChargepointState
 from modules.common.fault_state import ComponentInfo, FaultState
 from modules.common.store import get_internal_chargepoint_value_store, get_chargepoint_value_store
 from modules.internal_chargepoint_handler.clients import ClientHandler
+from modules.internal_chargepoint_handler.relay_safety import safe_relay_output
 from helpermodules.subdata import SubData
 from modules.internal_chargepoint_handler.internal_chargepoint_handler_config import InternalChargepoint
 
@@ -143,15 +144,17 @@ class ChargepointModule(AbstractChargepoint):
 
     def perform_phase_switch(self, phases_to_use: int) -> None:
         gpio_cp, gpio_relay = self._client.get_pins_phase_switch(phases_to_use)
+        evse = self._client.evse_client
+        cp = self.local_charge_point_num
         with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            self._client.evse_client.set_current(0)
+            evse.set_current(0)
         time.sleep(5)
-        GPIO.output(gpio_cp, GPIO.HIGH)  # CP off
-        GPIO.output(gpio_relay, GPIO.HIGH)  # 3 on/off
+        safe_relay_output(gpio_cp, GPIO.HIGH, evse, cp_num=cp, check_evse=False)  # CP off
+        safe_relay_output(gpio_relay, GPIO.HIGH, evse, cp_num=cp)  # 3 on/off
         time.sleep(5)
-        GPIO.output(gpio_relay, GPIO.LOW)  # 3 on/off
+        safe_relay_output(gpio_relay, GPIO.LOW, evse, cp_num=cp)  # 3 on/off
         time.sleep(5)
-        GPIO.output(gpio_cp, GPIO.LOW)  # CP on
+        safe_relay_output(gpio_cp, GPIO.LOW, evse, cp_num=cp, check_evse=False)  # CP on
         time.sleep(1)
 
     def perform_cp_interruption(self, duration: int) -> None:
