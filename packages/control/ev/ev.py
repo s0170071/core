@@ -80,6 +80,7 @@ class EvData:
     name: str = field(default="neues Fahrzeug", metadata={"topic": "name"})
     tag_id: List[str] = field(default_factory=empty_list_factory, metadata={
         "topic": "tag_id"})
+    current_offset: float = field(default=0, metadata={"topic": "current_offset"})
     get: Get = field(default_factory=get_factory)
 
 

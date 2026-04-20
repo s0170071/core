@@ -138,9 +138,22 @@ class Process:
         if chargepoint.data.control_parameter.state == ChargepointState.PERFORMING_PHASE_SWITCH:
             current = 0
 
+        # Vehicle current offset: compensates for vehicles that draw less/more than commanded.
+        # Applied only when charging is intended (current != 0) so all zero-forcing guards above
+        # are respected. Re-clamp to CP hardware ceiling; floor to min_current to avoid
+        # a large negative offset accidentally producing a sub-minimum command.
+        if current != 0:
+            offset = charging_ev.data.current_offset
+            if offset != 0:
+                current = current + offset
+                current = max(current, chargepoint.data.control_parameter.min_current)
+                current = chargepoint.check_cp_max_current(current, chargepoint.data.control_parameter.phases)
+                current = round(current, 2)
+
         chargepoint.data.set.current = current
         if chargepoint.data.get.plug_state:
-            log.info(f"LP{chargepoint.num}: set current {current} A, "
+            log.info(f"LP{chargepoint.num}: set current {current} A "
+                     f"(offset {charging_ev.data.current_offset:+.2f} A), "
                      f"state {ChargepointState(chargepoint.data.control_parameter.state).name}")
 
     def _start_charging(self, chargepoint: chargepoint.Chargepoint) -> Thread:
