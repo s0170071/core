@@ -80,6 +80,7 @@ class EvData:
     tag_id: List[str] = field(default_factory=empty_list_factory, metadata={
         "topic": "tag_id"})
     get: Get = field(default_factory=get_factory)
+    current_offset: float = field(default=0, metadata={"topic": "current_offset"})
 
 
 class Ev:

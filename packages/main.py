@@ -43,6 +43,8 @@ class HandlerAlgorithm:
         self.current_day = None
         self.handler_locks = {}
         self.handler_timestamps = {}
+        self.run_immediately = False
+        self._active = False
 
     def __acquire_lock(self, handler_name, error_threshold=60):
         """Versucht, den Lock für den angegebenen Handler zu erwerben.
@@ -131,14 +133,18 @@ class HandlerAlgorithm:
     def handler10Sec(self):
         """ führt den Algorithmus durch.
         """
+        self._active = True
         try:
             def handler_with_control_interval():
-                if (data.data.general_data.data.control_interval / 10) == self.interval_counter:
+                if (data.data.general_data.data.control_interval / 10) == self.interval_counter or self.run_immediately:
+                    skip_loadvars = self.run_immediately
+                    self.run_immediately = False
                     data.data.copy_data()
-                    loadvars_.get_values()
-                    wait_for_module_update_completed(loadvars_.event_module_update_completed,
-                                                     "openWB/set/system/device/module_update_completed")
-                    data.data.copy_data()
+                    if not skip_loadvars:
+                        loadvars_.get_values()
+                        wait_for_module_update_completed(loadvars_.event_module_update_completed,
+                                                         "openWB/set/system/device/module_update_completed")
+                        data.data.copy_data()
                     with ChangedValuesContext(loadvars_.event_module_update_completed):
                         self.heartbeat = True
                         if data.data.system_data["system"].data["perform_update"]:
@@ -171,6 +177,8 @@ class HandlerAlgorithm:
                 self.__release_lock("handler10Sec")
         except Exception:
             log.exception("Fehler im Main-Modul")
+        finally:
+            self._active = False
 
     @__with_handler_lock(error_threshold=60)
     def handler5MinAlgorithm(self):
@@ -313,9 +321,18 @@ try:
     gpio = InternalGpioHandler(event_restart_gpio)
     prep = prepare.Prepare()
     soc = update_soc.UpdateSoc(event_update_soc)
+    def _on_charge_mode_changed():
+        log.info("Sofortiger Algorithmus-Lauf durch Lademodusänderung.")
+        handler.run_immediately = True
+        deadline = time.time() + 35
+        while handler._active and time.time() < deadline:
+            time.sleep(0.1)
+        handler.handler10Sec()
+
     set = setdata.SetData(event_ev_template,
                           event_cp_config, event_soc,
-                          event_subdata_initialized)
+                          event_subdata_initialized,
+                          _on_charge_mode_changed)
     sub = subdata.SubData(event_ev_template,
                           event_cp_config, loadvars_.event_module_update_completed,
                           event_copy_data, event_global_data_initialized, event_command_completed,
@@ -325,7 +342,8 @@ try:
                           event_update_config_completed,
                           event_update_soc,
                           event_soc,
-                          event_jobs_running, event_modbus_server, event_restart_gpio)
+                          event_jobs_running, event_modbus_server, event_restart_gpio,
+                          general_internal_chargepoint_handler.event_update)
     comm = command.Command(event_command_completed)
     t_sub = Thread(target=sub.sub_topics, args=(), name="Subdata")
     t_set = Thread(target=set.set_data, args=(), name="Setdata")

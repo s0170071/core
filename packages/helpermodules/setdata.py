@@ -20,6 +20,7 @@ import dataclass_utils
 
 log = logging.getLogger(__name__)
 mqtt_log = logging.getLogger("mqtt")
+evse_relay_log = logging.getLogger("evse_relay")
 
 TIMESTAMP_2100 = 4102441200  # 01.01.2100 00:00:00
 
@@ -29,11 +30,13 @@ class SetData:
                  event_ev_template: Event,
                  event_cp_config: Event,
                  event_soc: Event,
-                 event_subdata_initialized: Event):
+                 event_subdata_initialized: Event,
+                 on_charge_mode_changed):
         self.event_ev_template = event_ev_template
         self.event_cp_config = event_cp_config
         self.event_soc = event_soc
         self.event_subdata_initialized = event_subdata_initialized
+        self.on_charge_mode_changed = on_charge_mode_changed
         self.heartbeat = False
 
     def set_data(self):
@@ -395,6 +398,8 @@ class SetData:
                 self._validate_value(msg, float, [(0, 1000)])
             elif "/get/force_soc_update" in msg.topic:
                 self._validate_value(msg, bool)
+            elif "/current_offset" in msg.topic:
+                self._validate_value(msg, float)
             else:
                 self.__unknown_topic(msg)
         except Exception:
@@ -411,8 +416,17 @@ class SetData:
             if (re.search("/vehicle/template/charge_template/[0-9]+$", msg.topic) is not None or
                     re.search("/chargepoint/[0-9]+/set/charge_template$", msg.topic) is not None):
                 self._validate_value(msg, "json")
+                _is_cp_charge_template = re.search(
+                    "/chargepoint/[0-9]+/set/charge_template$", msg.topic) is not None
+                if _is_cp_charge_template:
+                    try:
+                        _payload = decode_payload(msg.payload)
+                        _mode = _payload.get("selected", "") if isinstance(_payload, dict) else ""
+                        evse_relay_log.info(f"CP{get_index(msg.topic)}: charge_template button \u2192 chargemode={_mode}")
+                    except Exception:
+                        evse_relay_log.info(f"charge_template button: {msg.topic}")
                 if data.data.general_data.data.temporary_charge_templates_active is False:
-                    if re.search("/chargepoint/[0-9]+/set/charge_template$", msg.topic) is not None:
+                    if _is_cp_charge_template:
                         payload = decode_payload(msg.payload)
                         Pub().pub(f"openWB/vehicle/template/charge_template/{payload['id']}", payload)
                         cp_num = get_index(msg.topic)
@@ -433,6 +447,8 @@ class SetData:
                                         Pub().pub(
                                             f"openWB/chargepoint/{cp.num}/set/charge_template",
                                             decode_payload(msg.payload))
+                if _is_cp_charge_template:
+                    self.on_charge_mode_changed()
             else:
                 self.__unknown_topic(msg)
         except Exception:
