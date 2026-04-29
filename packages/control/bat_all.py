@@ -22,7 +22,6 @@ from enum import Enum
 import logging
 from typing import List, Optional
 
-from control import data
 from control.algorithm.chargemodes import CONSIDERED_CHARGE_MODES_CHARGING
 from control.algorithm.filter_chargepoints import get_chargepoints_with_required_current_by_chargemode
 from control.pv import Pv
@@ -78,7 +77,8 @@ class Set:
     charging_power_left: float = field(default=0, metadata={"topic": "set/charging_power_left"})
     power_limit: Optional[float] = field(default=None, metadata={"topic": "set/power_limit"})
     regulate_up: bool = field(default=False, metadata={"topic": "set/regulate_up"})
-    hysteresis_discharge: bool = field(default=False, metadata={"topic": "set/hysteresis_discharge"})
+    protect_active: bool = field(default=False, metadata={"topic": "set/protect_active"})
+    assist_active: bool = field(default=False, metadata={"topic": "set/assist_active"})
 
 
 def set_factory() -> Set:
@@ -204,88 +204,91 @@ class BatAll:
             self.data.set.regulate_up = False
             if config.bat_mode == BatConsiderationMode.BAT_MODE.value:
                 if self.data.get.power < 0:
-                    # Wenn der Speicher entladen wird, darf diese Leistung nicht zum Laden der Fahrzeuge genutzt werden.
-                    # Wenn der Speicher schneller regelt als die LP, würde sonst der Speicher reduziert werden.
                     charging_power_left = self.data.get.power
                 else:
                     charging_power_left = 0
                 self.data.set.regulate_up = True if self.data.get.soc < 100 else False
-            #  ev wird nach Speicher geladen
             elif config.bat_mode == BatConsiderationMode.EV_MODE.value:
-                # Speicher sollte weder ge- noch entladen werden.
                 charging_power_left = self.data.get.power
             else:
-                # Speicher soll geladen werden um min SoC zu erreichen
-                if self.data.get.soc < config.min_bat_soc:
-                    self.data.set.hysteresis_discharge = False
-                    if self.data.get.power < 0:
-                        # Wenn der Speicher entladen wird, darf diese Leistung nicht zum Laden der Fahrzeuge
-                        # genutzt werden. Wenn der Speicher schneller regelt als die LP, würde sonst der Speicher
-                        # reduziert werden.
-                        charging_power_left = self.data.get.power
+                # MIN_SOC_BAT mode — PROTECT / PRIORITY / ASSIST state machine
+                min_soc = config.min_bat_soc
+                max_soc = config.max_bat_soc
+                discharge_rate = config.bat_power_discharge if config.bat_power_discharge_active else 0
+                power = self.data.get.power
+                soc = self.data.get.soc
+
+                # Hysteresis latch: PROTECT until max reached
+                if soc <= min_soc:
+                    self.data.set.protect_active = True
+                    self.data.set.assist_active = False
+                if self.data.set.protect_active and soc >= max_soc:
+                    self.data.set.protect_active = False
+
+                if self.data.set.protect_active:
+                    # STATE: PROTECT — starve car, charge battery
+                    charging_power_left = -5000
+                    self.data.set.regulate_up = True
+                    log.debug(f"MIN_SOC_BAT PROTECT: soc={soc}%, cpl={charging_power_left}W")
+
+                elif self.data.set.assist_active:
+                    # STATE: ASSIST (latched) — battery helps car
+                    if not self._any_ev_charging():
+                        # Car stopped → exit ASSIST → PRIORITY
+                        self.data.set.assist_active = False
+                        if power < 0:
+                            charging_power_left = power
+                            self.data.set.regulate_up = True
+                        else:
+                            charging_power_left = 0
+                        log.debug(f"MIN_SOC_BAT ASSIST→PRIORITY: car stopped, cpl={charging_power_left}W")
+                    else:
+                        charging_power_left = discharge_rate + min(0, power)
+                        log.debug(f"MIN_SOC_BAT ASSIST: discharge_rate={discharge_rate}W, "
+                                  f"power={power}W, cpl={charging_power_left}W")
+
+                elif self._ev_at_min_current():
+                    # Entering ASSIST — car at min, soc > min
+                    self.data.set.assist_active = True
+                    charging_power_left = discharge_rate + min(0, power)
+                    log.debug(f"MIN_SOC_BAT ASSIST (enter): discharge_rate={discharge_rate}W, "
+                              f"power={power}W, cpl={charging_power_left}W")
+
+                else:
+                    # STATE: PRIORITY — battery recovers, car gets grid export only
+                    if power < 0:
+                        charging_power_left = power
                         self.data.set.regulate_up = True
                     else:
-                        # Speicher-Vorrang bis zum Min-Soc
-                        if config.bat_power_reserve_active:
-                            if self.data.get.power > config.bat_power_reserve:
-                                # die Differenz darf nicht zum Laden der EV genutzt werden.
-                                charging_power_left = self.data.get.power - config.bat_power_reserve
-                            else:
-                                charging_power_left = (
-                                    config.bat_power_reserve - self.data.get.power) * -1
-                                self.data.set.regulate_up = True
-                        else:
-                            # Speicher wird geladen
-                            charging_power_left = 0
-                            self.data.set.regulate_up = True
-                # Speicher zwischen min und max SoC
-                elif int(self.data.get.soc) >= config.min_bat_soc and int(self.data.get.soc) < config.max_bat_soc:
-                    # Speicher soll aktiv weder ge- noch entladen werden.
-                    # Mindest-SoC wird gehalten oder der Speicher mit weiterem vorhanden Überschuss geladen.
-                    if self.data.set.hysteresis_discharge is False:
-                        charging_power_left = self.data.get.power
-                    # Speicher darf wegen Hysterese bis min_bat_soc entladen werden.
-                    else:
-                        if self.data.set.power_limit is None:
-                            if config.bat_power_discharge_active:
-                                # Wenn der Speicher mit mehr als der erlaubten Entladeleistung entladen wird, muss das
-                                # vom Überschuss subtrahiert werden.
-                                charging_power_left = config.bat_power_discharge + self.data.get.power
-                                log.debug(f"Erlaubte Entlade-Leistung nutzen {charging_power_left}W")
-                            else:
-                                # Speicher sollte weder ge- noch entladen werden.
-                                charging_power_left = self.data.get.power
-                        else:
-                            log.debug("Keine erlaubte Entladeleistung freigeben, da der Speicher mit einer vorgegeben "
-                                      "Leistung entladen wird.")
-                            charging_power_left = 0
-                # Speicher oberhalb max SoC. Darf bis min SoC entladen werden.
-                else:
-                    self.data.set.hysteresis_discharge = True
-                    if self.data.set.power_limit is None:
-                        if config.bat_power_discharge_active:
-                            # Wenn der Speicher mit mehr als der erlaubten Entladeleistung entladen wird, muss das
-                            # vom Überschuss subtrahiert werden.
-                            charging_power_left = config.bat_power_discharge + self.data.get.power
-                            log.debug(f"Erlaubte Entlade-Leistung nutzen {charging_power_left}W")
-                        else:
-                            # Speicher sollte weder ge- noch entladen werden.
-                            charging_power_left = self.data.get.power
-                    else:
-                        log.debug("Keine erlaubte Entladeleistung freigeben, da der Speicher mit einer vorgegeben "
-                                  "Leistung entladen wird.")
                         charging_power_left = 0
-            # Keine Ladeleistung vom Speicher für Fahrzeuge einplanen, wenn max
-            # Ausgangsleistung erreicht ist.
+                    log.debug(f"MIN_SOC_BAT PRIORITY: power={power}W, cpl={charging_power_left}W, "
+                              f"regulate_up={self.data.set.regulate_up}")
+
             if self.data.set.regulate_up:
-                # 100(50 reichen auch?) W Überschuss übrig lassen, damit der Speicher bis zur max Ladeleistung
-                # hochregeln kann.
                 log.debug("Damit der Speicher hochregeln kann, muss unabhängig vom eingestellten Regelmodus "
                           "Einspeisung erzeugt werden.")
                 charging_power_left -= 100
             self.data.set.charging_power_left = self._limit_bat_power_discharge(charging_power_left)
         except Exception:
             log.exception("Fehler im Bat-Modul")
+
+    def _any_ev_charging(self) -> bool:
+        """True if any chargepoint is actively charging."""
+        for cp in data.data.cp_data.values():
+            if cp.data.get.charge_state:
+                return True
+        return False
+
+    def _ev_at_min_current(self) -> bool:
+        """True when at least one EV is charging AND all charging EVs are at their min_current."""
+        any_charging = False
+        for cp in data.data.cp_data.values():
+            if cp.data.get.charge_state:
+                any_charging = True
+                ev_template = cp.data.set.charging_ev_data.ev_template.data
+                if cp.data.set.current > ev_template.min_current:
+                    return False
+        return any_charging
 
     def power_for_bat_charging(self):
         """ gibt die Leistung zurück, die zum Laden verwendet werden kann.
@@ -357,6 +360,7 @@ class BatAll:
                 power_limit = None
             else:
                 power_limit = self._limit_bat_power_discharge(remaining_power_limit)
+                remaining_power_limit -= power_limit
 
             data.data.bat_data[f"bat{bat_component.component_config.id}"].data.set.power_limit = power_limit
 
@@ -370,3 +374,8 @@ def get_controllable_bat_components() -> List:
                     if comp_value.power_limit_controllable():
                         bat_components.append(comp_value)
     return bat_components
+
+
+# Deferred import: bat_all and data have a circular dependency (data.py imports BatAll).
+# By placing this import after BatAll is fully defined, the circular import resolves cleanly.
+from control import data  # noqa: E402

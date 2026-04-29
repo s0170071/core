@@ -12,10 +12,12 @@ from modules.common.component_state import ChargepointState
 from modules.common.fault_state import ComponentInfo, FaultState
 from modules.common.store import get_internal_chargepoint_value_store, get_chargepoint_value_store
 from modules.internal_chargepoint_handler.clients import ClientHandler
+from modules.internal_chargepoint_handler.relay_safety import safe_relay_output, _read_evse_current_from_hardware
 from helpermodules.subdata import SubData
 from modules.internal_chargepoint_handler.internal_chargepoint_handler_config import InternalChargepoint
 
 log = logging.getLogger(__name__)
+evse_relay_log = logging.getLogger("evse_relay")
 
 try:
     import RPi.GPIO as GPIO
@@ -44,6 +46,7 @@ class ChargepointModule(AbstractChargepoint):
             hide_exception=True)
         self.client_error_context.error_timestamp = internal_cp.get.error_timestamp
         self.old_plug_state = False
+        self._last_current_logged = None
         self.old_chargepoint_state = ChargepointState(plug_state=False,
                                                       charge_state=False,
                                                       imported=None,
@@ -52,6 +55,7 @@ class ChargepointModule(AbstractChargepoint):
                                                       phases_in_use=0,
                                                       power=0)
         self._client = client_handler
+        self._cp_safety_asserted = False
 
         self.version = SubData.system_data["system"].data["version"]
         self.current_branch = SubData.system_data["system"].data["current_branch"]
@@ -71,9 +75,44 @@ class ChargepointModule(AbstractChargepoint):
             BrokerClient(f"subscribeInternalCp{self.local_charge_point_num}",
                          on_connect, on_message).start_finite_loop()
 
+    def _assert_cp_safety_stop(self) -> None:
+        """Pull the CP pilot pin HIGH (disconnect) as a hardware-level safety stop
+        when EVSE Modbus communication has been failing for longer than the error timeout.
+        The vehicle will lose the pilot signal and stop charging even without EVSE co-operation.
+        """
+        gpio_cp = self._client.get_pins_cp_interruption()
+        try:
+            safe_relay_output(gpio_cp, GPIO.HIGH, self._client.evse_client,
+                              cp_num=self.local_charge_point_num, check_evse=True)
+            self._cp_safety_asserted = True
+            log.error(
+                "CP%d: EVSE communication failed for >%ds — CP pin GPIO%d forced HIGH (safety stop).",
+                self.local_charge_point_num, self.client_error_context.timeout, gpio_cp)
+        except Exception:
+            log.exception("CP%d: Failed to assert CP safety stop via GPIO%d",
+                          self.local_charge_point_num, gpio_cp)
+
+    def _release_cp_safety_stop(self) -> None:
+        """Pull the CP pilot pin LOW again once EVSE Modbus communication recovers."""
+        gpio_cp = self._client.get_pins_cp_interruption()
+        try:
+            safe_relay_output(gpio_cp, GPIO.LOW, self._client.evse_client,
+                              cp_num=self.local_charge_point_num, check_evse=True)
+            self._cp_safety_asserted = False
+            log.info(
+                "CP%d: EVSE communication restored — CP pin GPIO%d released (LOW).",
+                self.local_charge_point_num, gpio_cp)
+        except Exception:
+            log.exception("CP%d: Failed to release CP safety stop via GPIO%d",
+                          self.local_charge_point_num, gpio_cp)
+
     def set_current(self, current: float) -> None:
         with SingleComponentUpdateContext(self.fault_state, update_always=False):
             self._client.evse_client.set_current(current, phases_in_use=self.old_phases_in_use)
+        if current != self._last_current_logged:
+            evse_relay_log.info("CP%d: evse_current=%.1fA phases=%d",
+                                self.local_charge_point_num, current, self.old_phases_in_use)
+            self._last_current_logged = current
 
     def get_values(self, phase_switch_cp_active: bool, last_tag: str) -> ChargepointState:
         def store_state(chargepoint_state: ChargepointState) -> None:
@@ -129,6 +168,8 @@ class ChargepointModule(AbstractChargepoint):
                 current_commit=self.current_commit
             )
         if self.client_error_context.error_counter_exceeded():
+            if not self._cp_safety_asserted:
+                self._assert_cp_safety_stop()
             chargepoint_state = ChargepointState(plug_state=self.old_plug_state,
                                                  charge_state=False,
                                                  imported=self.old_chargepoint_state.imported,
@@ -136,6 +177,9 @@ class ChargepointModule(AbstractChargepoint):
                                                  currents=[0]*3,
                                                  phases_in_use=self.old_chargepoint_state.phases_in_use,
                                                  power=0)
+        elif self._cp_safety_asserted:
+            # Communication has recovered — release the CP safety stop
+            self._release_cp_safety_stop()
 
         store_state(chargepoint_state)
         self.old_chargepoint_state = chargepoint_state
@@ -143,25 +187,36 @@ class ChargepointModule(AbstractChargepoint):
 
     def perform_phase_switch(self, phases_to_use: int) -> None:
         gpio_cp, gpio_relay = self._client.get_pins_phase_switch(phases_to_use)
-        with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            self._client.evse_client.set_current(0)
-        time.sleep(5)
-        GPIO.output(gpio_cp, GPIO.HIGH)  # CP off
-        GPIO.output(gpio_relay, GPIO.HIGH)  # 3 on/off
-        time.sleep(5)
-        GPIO.output(gpio_relay, GPIO.LOW)  # 3 on/off
-        time.sleep(5)
-        GPIO.output(gpio_cp, GPIO.LOW)  # CP on
-        time.sleep(1)
+        evse = self._client.evse_client
+        cp = self.local_charge_point_num
+        with SingleComponentUpdateContext(self.fault_state, update_always=False, reraise=True):
+            evse.set_current(0)  # stop charging before switching phases
+            for _ in range(20):  # poll up to 10s (20 × 0.5s) for EVSE to confirm 0 A
+                if _read_evse_current_from_hardware(evse) == 0:
+                    break
+                time.sleep(0.5)
+                evse.set_current(0)  # send stop command again
+            else:
+                raise Exception("Ladung konnte nicht gestoppt werden - Phasenumschaltung abgebrochen.")
+        safe_relay_output(gpio_cp, GPIO.HIGH, evse, cp_num=cp)  # CP off
+        safe_relay_output(gpio_relay, GPIO.HIGH, evse, cp_num=cp)  # 3 on/off  turn on set or reset input of toggle relay
+        time.sleep(0.5)
+        safe_relay_output(gpio_relay, GPIO.LOW, evse, cp_num=cp)  # 3 turn off set/reset input of toggle relay
+        #time.sleep(0.5)
+        safe_relay_output(gpio_cp, GPIO.LOW, evse, cp_num=cp)  # CP on
+        #time.sleep(1)
+        self.old_phases_in_use = phases_to_use
 
     def perform_cp_interruption(self, duration: int) -> None:
         gpio_cp = self._client.get_pins_cp_interruption()
+        evse = self._client.evse_client
+        cp = self.local_charge_point_num
         with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            self._client.evse_client.set_current(0)
+            evse.set_current(0)
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BOARD)
         GPIO.setup(gpio_cp, GPIO.OUT)
 
-        GPIO.output(gpio_cp, GPIO.HIGH)
+        safe_relay_output(gpio_cp, GPIO.HIGH, evse, cp_num=cp, check_evse=False)
         time.sleep(duration)
-        GPIO.output(gpio_cp, GPIO.LOW)
+        safe_relay_output(gpio_cp, GPIO.LOW, evse, cp_num=cp, check_evse=False)

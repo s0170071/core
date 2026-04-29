@@ -28,7 +28,8 @@ except ImportError:
 
 
 class UpdateState:
-    def __init__(self, cp_module: chargepoint_module.ChargepointModule, hierarchy_id: int) -> None:
+    def __init__(self, cp_module: chargepoint_module.ChargepointModule, hierarchy_id: int,
+                 is_local: bool = False) -> None:
         self.old_phases_to_use = 0
         self.old_set_current = 0
         self.phase_switch_thread = None  # type: Optional[Thread]
@@ -36,6 +37,7 @@ class UpdateState:
         self.actor_cooldown_thread = None  # type: Optional[Thread]
         self.cp_module = cp_module
         self.hierarchy_id = hierarchy_id
+        self.is_local = is_local
 
     def update_state(self, data: InternalChargepoint, heartbeat_expired: bool) -> None:
         if heartbeat_expired:
@@ -55,7 +57,8 @@ class UpdateState:
                           " noch aktiv. Es muss erst gewartet werden, bis die CP-Unterbrechung abgeschlossen ist.")
                 return
         self.cp_module.set_current(set_current)
-        pub_single(f"openWB/set/chargepoint/{self.hierarchy_id}/set/current", payload=set_current)
+        if not self.is_local:
+            pub_single(f"openWB/set/chargepoint/{self.hierarchy_id}/set/current", payload=set_current)
         if data.trigger_phase_switch:
             log.debug("Switch Phases from "+str(self.old_phases_to_use) + " to " + str(data.phases_to_use))
             self.__thread_phase_switch(data.phases_to_use)
@@ -92,10 +95,12 @@ class InternalChargepointHandler:
                  parent_cp1: Optional[str],
                  hierarchy_id_cp1: Optional[int],
                  event_start: Event,
-                 event_stop: Event) -> None:
+                 event_stop: Event,
+                 event_update: Event) -> None:
         log.debug(f"Init internal chargepoint as {mode}")
         self.event_start = event_start
         self.event_stop = event_stop
+        self.event_update = event_update
         self.heartbeat = False
         self.fault_state_info_cp0 = FaultState(
             ComponentInfo(0, "Interner Ladepunkt 0", "internal_chargepoint", hierarchy_id=hierarchy_id_cp0))
@@ -160,7 +165,10 @@ class InternalChargepointHandler:
                 if self.cp1:
                     heartbeat_cp1 = self.cp1.update(data["global_data"], data["cp1"].data, data["rfid_data"])
                 self.heartbeat = True if heartbeat_cp0 and heartbeat_cp1 else False
-                time.sleep(1.1)
+                woken = self.event_update.wait(1.1)
+                self.event_update.clear()
+                if woken:
+                    log.info("Sofortige Aktualisierung durch set_current-Änderung.")
         with SingleComponentUpdateContext(self.fault_state_info_cp0, update_always=False):
             # Allgemeine Fehlermeldungen an LP 1
             if self.cp0 is not None and self.cp0.mode == InternalChargepointMode.PRO_PLUS:
@@ -206,7 +214,8 @@ class HandlerChargepoint:
             self.module = chargepoint_module.ChargepointModule(
                 local_charge_point_num, client_handler, internal_cp, hierarchy_id)
         with SingleComponentUpdateContext(self.module.fault_state):
-            self.update_state = UpdateState(self.module, hierarchy_id)
+            self.update_state = UpdateState(self.module, hierarchy_id,
+                                             is_local=(global_data.parent_ip == "localhost"))
             self.old_plug_state = False
             if global_data.parent_ip != "localhost":
                 pub_single(f"openWB/set/chargepoint/{hierarchy_id}/get/state_str",
@@ -225,6 +234,9 @@ class HandlerChargepoint:
                 self.update_state.phase_switch_thread)
             state = self.module.get_values(phase_switch_cp_active, rfid_data.last_tag)
             log.debug("Published plug state "+str(state.plug_state))
+            # Re-read latest set_current in case it changed during hardware reads
+            data.set_current = SubData.internal_chargepoint_data[
+                f"cp{self.local_charge_point_num}"].data.set_current
             heartbeat_expired = self._check_heartbeat_expired(global_data.heartbeat)
             self.update_state.update_state(data, heartbeat_expired)
             return True
@@ -243,6 +255,7 @@ class GeneralInternalChargepointHandler:
     def __init__(self) -> None:
         self.event_stop = Event()
         self.event_start = Event()
+        self.event_update = Event()
 
     def handler(self):
         while True:
@@ -272,7 +285,8 @@ class GeneralInternalChargepointHandler:
                         data["cp1"],
                         hierarchy_id_cp1,
                         self.event_start,
-                        self.event_stop)
+                        self.event_stop,
+                        self.event_update)
                     self.internal_chargepoint_handler.loop()
                 except UnboundLocalError:
                     log.debug("Kein interner Ladepunkt konfiguriert.")

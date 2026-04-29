@@ -10,6 +10,7 @@ from modules.common.component_state import EvseState
 from modules.common.modbus import ModbusDataType
 
 log = logging.getLogger(__name__)
+evse_relay_log = logging.getLogger("evse_relay")
 
 
 class EvseStatusCode(IntEnum):
@@ -46,6 +47,8 @@ class Evse:
                 if self.is_precise_current_active() is False:
                     self.activate_precise_current()
                 self._precise_current = self.is_precise_current_active()
+        self._toggle_timestamps = []
+        self._last_was_zero = None
 
     def get_plug_charge_state(self) -> Tuple[bool, bool, float]:
         time.sleep(0.1)
@@ -61,9 +64,10 @@ class Evse:
                              str(state)+", Soll-Stromstärke: "+str(self.evse_current))
         plugged = state.plugged
         charging = self.evse_current > 0 if state.charge_enabled else False
-        if self.evse_current > 32:
-            self.evse_current = self.evse_current / 100
-        return plugged, charging, self.evse_current
+        # Convert to amps for the return value only; keep self.evse_current in raw register units
+        # so it matches the format stored by set_current() and the guard comparison works correctly.
+        set_current_amps = self.evse_current / 100 if self._precise_current else float(self.evse_current)
+        return plugged, charging, set_current_amps
 
     def get_firmware_version(self) -> int:
         return self.version
@@ -94,7 +98,7 @@ class Evse:
             return
         else:
             with ModifyLoglevelContext(log, logging.DEBUG):
-                log.debug("Bit zur Angabe der Ströme in 0,1A-Schritten wird gesetzt.")
+                log.debug("Bit zur Angabe der Ströme in 0,01A-Schritten wird gesetzt.")
             self.client.write_registers(2005, value ^ self.PRECISE_CURRENT_BIT, unit=self.id)
             # Zeit zum Verarbeiten geben
             time.sleep(1)
@@ -104,7 +108,7 @@ class Evse:
         value = self.client.read_holding_registers(2005, ModbusDataType.UINT_16, unit=self.id)
         if value & self.PRECISE_CURRENT_BIT:
             with ModifyLoglevelContext(log, logging.DEBUG):
-                log.debug("Bit zur Angabe der Ströme in 0,1A-Schritten wird zurueckgesetzt.")
+                log.debug("Bit zur Angabe der Ströme in 0,01A-Schritten wird zurueckgesetzt.")
             self.client.write_registers(2005, value ^ self.PRECISE_CURRENT_BIT, unit=self.id)
         else:
             return
@@ -119,3 +123,16 @@ class Evse:
         formatted_current = round(current*100) if self._precise_current else round(current)
         if self.evse_current != formatted_current:
             self.client.write_registers(1000, formatted_current, unit=self.id)
+            evse_relay_log.info("EVSE id=%d: set_current %.2fA (reg=%d, prev_reg=%d)",
+                               self.id, current, formatted_current, self.evse_current)
+            self.evse_current = formatted_current
+            is_zero = formatted_current == 0
+            if self._last_was_zero is not None and is_zero != self._last_was_zero:
+                now = time.time()
+                self._toggle_timestamps = [t for t in self._toggle_timestamps if now - t < 120]
+                self._toggle_timestamps.append(now)
+                if len(self._toggle_timestamps) >= 3:
+                    evse_relay_log.warning(
+                        "EVSE id=%d: %d zero/non-zero toggles in 120s — possible relay loop!",
+                        self.id, len(self._toggle_timestamps))
+            self._last_was_zero = is_zero

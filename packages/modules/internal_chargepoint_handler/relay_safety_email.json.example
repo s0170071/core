@@ -1,0 +1,7 @@
+{
+    "smtp_host": "posteo.de",
+    "smtp_port": 587,
+    "smtp_user": "drk@posteo.de",
+    "smtp_password": "REPLACE_WITH_APP_PASSWORD",
+    "recipient": "drk@posteo.de"
+}

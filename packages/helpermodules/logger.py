@@ -109,18 +109,42 @@ def filter_pos(name: str, record) -> bool:
 
 
 class InMemoryLogHandler(logging.Handler):
-    def __init__(self, base_handler=None):
+    def __init__(self, base_handler=None, max_size_mb=50):
         super().__init__()
         self.base_handler = base_handler
         self.log_stream = io.StringIO()
         self.has_warning_or_error = False
+        self.max_size_bytes = max_size_mb * 1024 * 1024  # Convert MB to bytes
+        self.line_count = 0
 
     def emit(self, record):
         if self.base_handler is None or self.base_handler.filter(record):
             msg = self.format(record)
             self.log_stream.write(msg + '\n')
+            self.line_count += 1
+
+            # Check size every 100 lines to avoid performance overhead
+            if self.line_count % 100 == 0:
+                current_size = len(self.log_stream.getvalue().encode('utf-8'))
+                if current_size > self.max_size_bytes:
+                    self._truncate_logs()
+
             if record.levelno >= logging.WARNING:
                 self.has_warning_or_error = True
+
+    def _truncate_logs(self):
+        """Keep only the last 25% of logs when size limit is exceeded"""
+        current_logs = self.log_stream.getvalue()
+        lines = current_logs.split('\n')
+
+        # Keep only the last 25% of lines
+        keep_count = max(100, len(lines) // 4)  # At least 100 lines
+        kept_lines = lines[-keep_count:]
+
+        # Reset the stream with truncated content
+        self.log_stream = io.StringIO()
+        self.log_stream.write('\n'.join(kept_lines))
+        self.line_count = len(kept_lines)
 
     def get_logs(self):
         return self.log_stream.getvalue()
@@ -128,6 +152,7 @@ class InMemoryLogHandler(logging.Handler):
     def clear(self):
         self.log_stream = io.StringIO()
         self.has_warning_or_error = False
+        self.line_count = 0
 
 
 def clear_in_memory_log_handler(logger_name: str = None) -> None:
@@ -259,6 +284,14 @@ def setup_logging() -> None:
         RAMDISK_PATH + 'garbage_collector.log', maxBytes=mb_to_bytes(0.5), backupCount=1)
     garbage_collector_file_handler.setFormatter(logging.Formatter(FORMAT_STR_SHORT))
     garbage_collector_log.addHandler(garbage_collector_file_handler)
+
+    # EVSE / relay operation logger
+    evse_relay_log = logging.getLogger("evse_relay")
+    evse_relay_log.propagate = False
+    evse_relay_log_handler = RotatingFileHandler(
+        RAMDISK_PATH + 'evse_relay.log', maxBytes=mb_to_bytes(1), backupCount=1)
+    evse_relay_log_handler.setFormatter(logging.Formatter(FORMAT_STR_SHORT))
+    evse_relay_log.addHandler(evse_relay_log_handler)
 
     # tracemalloc logger
     tracemalloc_log = logging.getLogger("tracemalloc")

@@ -300,7 +300,13 @@ class Counter:
                 # Timer starten
                 if (surplus >= threshold) and ((feed_in_limit and self.data.set.reserved_surplus == 0) or
                                                not feed_in_limit):
-                    timestamp_switch_on_off = timecheck.create_timestamp()
+                    # If the user just switched mode in the GUI, start the timer nearly elapsed
+                    # so charging begins on the next cycle rather than after the full delay.
+                    if chargepoint.chargemode_changed:
+                        timestamp_switch_on_off = timecheck.create_timestamp() - max(
+                            pv_config.switch_on_delay  , 0)
+                    else:
+                        timestamp_switch_on_off = timecheck.create_timestamp()
                     self.data.set.reserved_surplus += power_to_reserve
                     message = self.SWITCH_ON_WAITING.format(timecheck.convert_timestamp_delta_to_time_string(
                         timestamp_switch_on_off, pv_config.switch_on_delay))
