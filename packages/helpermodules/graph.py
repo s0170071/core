@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import threading
 import time
 import datetime
 import logging
@@ -11,6 +12,12 @@ from helpermodules.utils.run_command import run_command
 from modules.common.fault_state import FaultStateLevel
 
 log = logging.getLogger(__name__)
+
+# Module-level coordination for the background graphing.sh worker.
+# Kept outside the Graph class because Graph instances are deepcopied
+# by data.copy_data(), and threading.Lock cannot be pickled.
+_graphing_shell_lock = threading.Lock()
+_graphing_shell_running = False
 
 
 @dataclass
@@ -30,6 +37,20 @@ class GraphData:
 class Graph:
     def __init__(self) -> None:
         self.data = GraphData()
+
+    def _run_graphing_shell(self, duration_arg: str) -> None:
+        global _graphing_shell_running
+        try:
+            t0 = time.monotonic()
+            run_command([str(Path(__file__).resolve().parents[2] / "runs"/"graphing.sh"),
+                         duration_arg])
+            log.debug("graphing.sh background run done in %.3fs",
+                      time.monotonic() - t0)
+        except Exception:
+            log.exception("graphing.sh background run failed")
+        finally:
+            with _graphing_shell_lock:
+                _graphing_shell_running = False
 
     def pub_graph_data(self):
         """ schreibt die Graph-Daten, sodass sie zu dem 1.9er graphing.sh passen.
@@ -64,7 +85,21 @@ class Graph:
             Pub().pub("openWB/set/system/lastlivevaluesJson", data_line)
             with open(str(Path(__file__).resolve().parents[2] / "ramdisk"/"graph_live.json"), "a") as f:
                 f.write(f"{json.dumps(data_line, separators=(',', ':'))}\n")
-            run_command([str(Path(__file__).resolve().parents[2] / "runs"/"graphing.sh"),
-                         str(self.data.config.duration*6)])
+
+            # Fire-and-forget the graphing.sh shell-out. Skip if the
+            # previous run hasn't finished yet (graphing.sh always reads
+            # the freshest file content, so a missed run is harmless).
+            global _graphing_shell_running
+            with _graphing_shell_lock:
+                if _graphing_shell_running:
+                    log.debug("graphing.sh still running, skipping this tick")
+                else:
+                    _graphing_shell_running = True
+                    threading.Thread(
+                        target=self._run_graphing_shell,
+                        args=(str(self.data.config.duration*6),),
+                        name="graphing.sh",
+                        daemon=True,
+                    ).start()
         except Exception:
             log.exception("Fehler im Graph-Modul")

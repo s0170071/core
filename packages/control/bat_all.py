@@ -207,7 +207,13 @@ class BatAll:
                     charging_power_left = self.data.get.power
                 else:
                     charging_power_left = 0
-                self.data.set.regulate_up = True if self.data.get.soc < 100 else False
+                # Treat the battery as "full" once it reaches the configured max SoC,
+                # not at a hardcoded 100%. Otherwise regulate_up stays True forever
+                # (chargers see -100W reserve + forced switch-off when raw_surplus<=0)
+                # and PV charging will not start even though the battery is full per
+                # the user's configuration.
+                self.data.set.regulate_up = (
+                    True if self.data.get.soc < config.max_bat_soc else False)
             elif config.bat_mode == BatConsiderationMode.EV_MODE.value:
                 charging_power_left = self.data.get.power
             else:

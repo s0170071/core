@@ -106,6 +106,8 @@ class Params:
     expected_msg: Optional[str]
     expected_timestamp_switch_on_off: Optional[str]
     expected_reserved_surplus: float
+    switch_on_delay: int = 30
+    expected_state: Optional[ChargepointState] = None
 
 
 cases = [
@@ -127,6 +129,11 @@ cases = [
            15000, None, ChargepointState.NO_CHARGING_ALLOWED, Counter.SWITCH_ON_NOT_EXCEEDED.format(1500), None, 0),
     Params("Feed_in_limit, Einschaltschwelle läuft", True, 1500, 15001,
            15000, 1652683250.0, ChargepointState.SWITCH_ON_DELAY, None, 1652683250.0, 1500),
+    Params("switch_on_delay = 0, Schwelle erreicht, sofort freigeben", False, 0, 1501, 1500,
+           None, ChargepointState.NO_CHARGING_ALLOWED,
+           Counter.SWITCH_ON_EXPIRED.format(1500), None, 0,
+           switch_on_delay=0,
+           expected_state=ChargepointState.WAIT_FOR_USING_PHASES),
 ]
 
 
@@ -145,6 +152,7 @@ def test_switch_on_threshold_reached(params: Params, caplog, general_data_fixtur
     cp.data.set.charging_ev_data = ev
     mock_calc_switch_on_power = Mock(return_value=[params.surplus, params.threshold])
     monkeypatch.setattr(Counter, "calc_switch_on_power", mock_calc_switch_on_power)
+    data.data.general_data.data.chargemode_config.pv_charging.switch_on_delay = params.switch_on_delay
 
     # execution
     c.switch_on_threshold_reached(cp)
@@ -154,6 +162,8 @@ def test_switch_on_threshold_reached(params: Params, caplog, general_data_fixtur
     assert cp.data.get.state_str is None or cp.data.get.state_str == params.expected_msg
     assert (cp.data.control_parameter.timestamp_switch_on_off ==
             params.expected_timestamp_switch_on_off)
+    if params.expected_state is not None:
+        assert cp.data.control_parameter.state == params.expected_state
 
 
 @pytest.mark.parametrize("control_range, evu_power, expected_range_offset",

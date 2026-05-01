@@ -313,6 +313,41 @@ class Counter:
                     if feed_in_limit:
                         message += "Die Einspeisegrenze wird berücksichtigt."
                     control_parameter.state = ChargepointState.SWITCH_ON_DELAY
+                    # Collapse the two-tick handshake when the operator wants no delay
+                    # OR when the user just switched the chargemode in the GUI: PV power
+                    # is already known via async inverter polling, so debouncing the
+                    # surplus reading buys nothing and only delays the user-visible action.
+                    # All safety gates (surplus >= threshold, feed-in reserve check)
+                    # have just been evaluated; expire the timer immediately so that
+                    # downstream stages of the SAME tick allocate min_current and
+                    # surplus current.
+                    if pv_config.switch_on_delay == 0 or chargepoint.chargemode_changed:
+                        self.data.set.reserved_surplus -= power_to_reserve
+                        timestamp_switch_on_off = None
+                        control_parameter.state = ChargepointState.WAIT_FOR_USING_PHASES
+                        message = self.SWITCH_ON_EXPIRED.format(pv_config.switch_on_threshold)
+                        # Mirror the max-phases jump that switch_on_timer_expired does:
+                        # if surplus is high enough to run all phases at min_current,
+                        # commit to max_phases right now so we don't start 1-phase and
+                        # then trigger a phase-switch on the very next tick.
+                        try:
+                            charging_ev_data = chargepoint.data.set.charging_ev_data
+                            ev_template = charging_ev_data.ev_template
+                            max_phases_power = (ev_template.data.min_current *
+                                                ev_template.data.max_phases * 230)
+                            if (control_parameter.submode == Chargemode.PV_CHARGING and
+                                chargepoint.data.set.charge_template.data.chargemode.pv_charging
+                                    .phases_to_use == 0 and
+                                    chargepoint.hw_supports_phase_switch() and
+                                    self.get_usable_surplus(
+                                        pv_config.feed_in_yield if feed_in_limit else 0)
+                                    > max_phases_power):
+                                control_parameter.phases = ev_template.data.max_phases
+                                message += " " + self.SWITCH_ON_MAX_PHASES.format(
+                                    ev_template.data.max_phases)
+                        except Exception:
+                            log.exception(
+                                "switch_on_threshold_reached: max-phases jump failed")
                 else:
                     # Einschaltschwelle nicht erreicht
                     message = self.SWITCH_ON_NOT_EXCEEDED.format(pv_config.switch_on_threshold)

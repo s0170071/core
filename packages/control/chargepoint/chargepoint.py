@@ -497,7 +497,19 @@ class Chargepoint(ChargepointRfidMixin):
                 if ((not charging_ev.ev_template.data.prevent_phase_switch or
                         self.data.set.log.imported_since_plugged == 0) and
                         self.data.config.auto_phase_switch_hw):
-                    phases = 1
+                    # Default to 1-phase for fresh PV starts, EXCEPT when the
+                    # PV switch-on logic (counter.switch_on_threshold_reached /
+                    # switch_on_timer_expired) has already committed to
+                    # max_phases because surplus is sufficient. Without this
+                    # exception, get_phases_by_selected_chargemode runs every
+                    # cycle BEFORE the algorithm and overwrites the max-phases
+                    # commitment, causing a 1-phase start followed by an
+                    # immediate 3->1 hardware phase switch.
+                    if (self.data.control_parameter.state == ChargepointState.WAIT_FOR_USING_PHASES
+                            and self.data.control_parameter.phases > 1):
+                        phases = self.data.control_parameter.phases
+                    else:
+                        phases = 1
                 else:
                     if self.data.set.phases_to_use != 0:
                         phases = self.data.set.phases_to_use

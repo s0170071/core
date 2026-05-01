@@ -2,6 +2,7 @@
 """Starten der benötigten Prozesse
 """
 # flake8: noqa: E402
+import contextlib
 import logging
 from helpermodules import logger
 from helpermodules.utils import run_command, thread_handler
@@ -13,6 +14,7 @@ import functools
 logger.setup_logging()
 log = logging.getLogger()
 
+import datetime
 from pathlib import Path
 from random import randrange
 import schedule
@@ -25,19 +27,32 @@ from control import data, prepare, process
 from control.algorithm import algorithm
 from helpermodules import command, setdata, subdata, timecheck, update_config
 from helpermodules.changed_values_handler import ChangedValuesContext
+from helpermodules.instant_trigger import InstantTrigger
 from helpermodules.measurement_logging.update_yields import update_daily_yields, update_pv_monthly_yearly_yields
 from helpermodules.measurement_logging.write_log import LogType, save_log
 from helpermodules.modbusserver import start_modbus_server
 from helpermodules.pub import Pub
 from modules import configuration, loadvars, update_soc
+from modules.loadvars_runner import LoadvarsRunner
 from modules.internal_chargepoint_handler.internal_chargepoint_handler import GeneralInternalChargepointHandler
 from modules.internal_chargepoint_handler.gpio import InternalGpioHandler
 from modules.internal_chargepoint_handler.rfid import RfidReader
 from modules.utils import wait_for_module_update_completed
 from smarthome.smarthome import readmq, smarthome_handler
 
+# Feature flag for the decoupled loadvars architecture (see decouple.md).
+# Set to False to fall back to the original synchronous loadvars-inside-
+# handler10Sec flow without redeploying old code.
+DECOUPLED_LOADVARS = True
+
 
 class HandlerAlgorithm:
+    # print_all() is a verbose dump of the entire data tree (~0.3-1.0 s
+    # on a Pi 3B+). It is debug telemetry, not control logic, so we run
+    # it only every Nth full tick to keep average per-tick cost low
+    # while still producing periodic snapshots in the log.
+    PRINT_ALL_EVERY_N_TICKS = 6  # ~once per minute at default cadence
+
     def __init__(self):
         self.interval_counter = 1
         self.current_day = None
@@ -45,6 +60,7 @@ class HandlerAlgorithm:
         self.handler_timestamps = {}
         self.run_immediately = False
         self._active = False
+        self._print_all_counter = 0
 
     def __acquire_lock(self, handler_name, error_threshold=60):
         """Versucht, den Lock für den angegebenen Handler zu erwerben.
@@ -139,24 +155,76 @@ class HandlerAlgorithm:
                 if (data.data.general_data.data.control_interval / 10) == self.interval_counter or self.run_immediately:
                     skip_loadvars = self.run_immediately
                     self.run_immediately = False
-                    data.data.copy_data()
-                    if not skip_loadvars:
-                        loadvars_.get_values()
-                        wait_for_module_update_completed(loadvars_.event_module_update_completed,
-                                                         "openWB/set/system/device/module_update_completed")
-                        data.data.copy_data()
-                    with ChangedValuesContext(loadvars_.event_module_update_completed):
-                        self.heartbeat = True
-                        if data.data.system_data["system"].data["perform_update"]:
-                            data.data.system_data["system"].perform_update()
-                            return
-                        elif data.data.system_data["system"].data["update_in_progress"]:
-                            log.info("Regelung pausiert, da ein Update durchgeführt wird.")
-                        event_global_data_initialized.set()
-                        prep.setup_algorithm()
-                        control.calc_current()
-                        proc.process_algorithm_results()
+                    if DECOUPLED_LOADVARS and loadvars_runner is not None:
+                        # Phase A runs continuously in the LoadvarsRunner
+                        # background thread (auto-rearmed every
+                        # MIN_CYCLE_GAP_S). We do NOT request a fresh
+                        # cycle here and we do NOT wait — we simply
+                        # consume whatever snapshot the runner has most
+                        # recently produced. This decouples algorithm
+                        # latency from device I/O latency entirely.
+                        age = loadvars_runner.last_snapshot_age_s()
+                        if loadvars_runner.cycle_count() == 0:
+                            log.warning(
+                                "handler10Sec: noch kein Snapshot vom "
+                                "LoadvarsRunner verfügbar, nutze "
+                                "Initialwerte aus data.data.")
+                        else:
+                            log.debug(
+                                "handler10Sec: nutze vorhandenen Snapshot "
+                                f"(Alter {age:.1f}s, "
+                                f"skip_loadvars={skip_loadvars}).")
+                        # Hold the snapshot lock only for prep + calc +
+                        # proc (the actual decision/control work). graph
+                        # and print_all are read-only reporting tasks
+                        # that we run *outside* the snapshot lock so the
+                        # LoadvarsRunner can publish a fresh snapshot in
+                        # parallel while we serialise telemetry to disk
+                        # and shell out to graphing.sh.
+                        with loadvars_runner.snapshot_lock():
+                            with ChangedValuesContext(loadvars_.event_module_update_completed):
+                                self.heartbeat = True
+                                if data.data.system_data["system"].data["perform_update"]:
+                                    data.data.system_data["system"].perform_update()
+                                    return
+                                elif data.data.system_data["system"].data["update_in_progress"]:
+                                    log.info("Regelung pausiert, da ein Update durchgeführt wird.")
+                                event_global_data_initialized.set()
+                                prep.setup_algorithm()
+                                control.calc_current()
+                                proc.process_algorithm_results()
+                        # --- snapshot lock released here ---
+                        # Reporting tasks below may read slightly stale
+                        # data.data fields if the runner refreshed in
+                        # between, which is acceptable for telemetry.
                         data.data.graph_data.pub_graph_data()
+                        # print_all() is a verbose data-tree dump used
+                        # for offline debugging. Run it every Nth tick
+                        # only to amortise its ~0.3-1.0 s cost.
+                        self._print_all_counter += 1
+                        if self._print_all_counter >= self.PRINT_ALL_EVERY_N_TICKS:
+                            self._print_all_counter = 0
+                            data.data.print_all()
+                    else:
+                        # Original synchronous flow (rollback path).
+                        data.data.copy_data()
+                        if not skip_loadvars:
+                            loadvars_.get_values()
+                            wait_for_module_update_completed(loadvars_.event_module_update_completed,
+                                                             "openWB/set/system/device/module_update_completed")
+                            data.data.copy_data()
+                        with ChangedValuesContext(loadvars_.event_module_update_completed):
+                            self.heartbeat = True
+                            if data.data.system_data["system"].data["perform_update"]:
+                                data.data.system_data["system"].perform_update()
+                                return
+                            elif data.data.system_data["system"].data["update_in_progress"]:
+                                log.info("Regelung pausiert, da ein Update durchgeführt wird.")
+                            event_global_data_initialized.set()
+                            prep.setup_algorithm()
+                            control.calc_current()
+                            proc.process_algorithm_results()
+                            data.data.graph_data.pub_graph_data()
                     self.interval_counter = 1
                 else:
                     self.interval_counter = self.interval_counter + 1
@@ -186,16 +254,17 @@ class HandlerAlgorithm:
         ausführt, die nur alle 5 Minuten ausgeführt werden müssen.
         """
         try:
-            with ChangedValuesContext(loadvars_.event_module_update_completed):
-                totals = save_log(LogType.DAILY)
-                update_daily_yields(totals)
-                update_pv_monthly_yearly_yields()
-                for cp in data.data.cp_data.values():
-                    calc_energy_costs(cp)
-                data.data.general_data.grid_protection()
-                data.data.optional_data.ocpp_transfer_meter_values()
-                data.data.counter_all_data.validate_hierarchy()
-                data.data.optional_data.remove_outdated_prices()
+            with _snapshot_lock_cm():
+                with ChangedValuesContext(loadvars_.event_module_update_completed):
+                    totals = save_log(LogType.DAILY)
+                    update_daily_yields(totals)
+                    update_pv_monthly_yearly_yields()
+                    for cp in data.data.cp_data.values():
+                        calc_energy_costs(cp)
+                    data.data.general_data.grid_protection()
+                    data.data.optional_data.ocpp_transfer_meter_values()
+                    data.data.counter_all_data.validate_hierarchy()
+                    data.data.optional_data.remove_outdated_prices()
             loadvars_.ep_get_prices()
         except Exception:
             log.exception("Fehler im Main-Modul")
@@ -229,8 +298,9 @@ class HandlerAlgorithm:
                     general_internal_chargepoint_handler.event_start.set()
                 else:
                     general_internal_chargepoint_handler.internal_chargepoint_handler.heartbeat = False
-            with ChangedValuesContext(loadvars_.event_module_update_completed):
-                sub.system_data["system"].update_ip_address()
+            with _snapshot_lock_cm():
+                with ChangedValuesContext(loadvars_.event_module_update_completed):
+                    sub.system_data["system"].update_ip_address()
         except Exception:
             log.exception("Fehler im Main-Modul")
 
@@ -276,9 +346,41 @@ def schedule_jobs():
     schedule.every().day.at("00:00:00").do(handler.handler_midnight).tag("algorithm")
     schedule.every().day.at(f"0{randrange(0, 5)}:{randrange(0, 59):02d}:{randrange(0, 59):02d}").do(
         handler.handler_random_nightly)
-    [schedule.every().minute.at(f":{i:02d}").do(handler.handler10Sec).tag("algorithm") for i in range(0, 60, 10)]
+    [schedule.every().minute.at(f":{i:02d}").do(handler.handler10Sec).tag("algorithm").tag("algorithm_10sec")
+     for i in range(0, 60, 10)]
     # 30 Sekunden Handler, der die Locks überwacht, Deadlocks erkennt, loggt und ggf. den Prozess beendet
     schedule.every(30).seconds.do(handler.monitor_handler_locks, max_runtime=600)
+
+
+def _resync_algorithm_schedule():
+    """Re-arm the 10 s algorithm cadence so handler10Sec runs on the next
+    schedule.run_pending() call (within ~50 ms) and then every 10 s
+    thereafter. Must be called from the main thread only (schedule is not
+    thread-safe).
+    """
+    schedule.clear("algorithm_10sec")
+    job = (schedule.every(10).seconds
+                   .do(handler.handler10Sec)
+                   .tag("algorithm").tag("algorithm_10sec"))
+    job.next_run = datetime.datetime.now()
+    handler.run_immediately = True
+    log.debug("Algorithmus-Schedule auf jetzt synchronisiert (instant trigger).")
+
+
+# Will be set after data_init / subdata initialization. Referenced by
+# handler10Sec and the snapshot-lock helper below.
+loadvars_runner = None  # type: "LoadvarsRunner | None"
+
+
+@contextlib.contextmanager
+def _snapshot_lock_cm():
+    """Hold the LoadvarsRunner snapshot lock if the runner exists,
+    otherwise no-op (rollback path / pre-runner startup)."""
+    if DECOUPLED_LOADVARS and loadvars_runner is not None:
+        with loadvars_runner.snapshot_lock():
+            yield
+    else:
+        yield
 
 
 try:
@@ -316,23 +418,17 @@ try:
     event_modbus_server = Event()
     event_jobs_running = Event()
     event_jobs_running.set()
+    event_trigger_algorithm = Event()
+    instant_trigger = InstantTrigger(event_trigger_algorithm)
     event_update_soc = Event()
     event_restart_gpio = Event()
     gpio = InternalGpioHandler(event_restart_gpio)
     prep = prepare.Prepare()
     soc = update_soc.UpdateSoc(event_update_soc)
-    def _on_charge_mode_changed():
-        log.info("Sofortiger Algorithmus-Lauf durch Lademodusänderung.")
-        handler.run_immediately = True
-        deadline = time.time() + 35
-        while handler._active and time.time() < deadline:
-            time.sleep(0.1)
-        handler.handler10Sec()
 
     set = setdata.SetData(event_ev_template,
                           event_cp_config, event_soc,
-                          event_subdata_initialized,
-                          _on_charge_mode_changed)
+                          event_subdata_initialized)
     sub = subdata.SubData(event_ev_template,
                           event_cp_config, loadvars_.event_module_update_completed,
                           event_copy_data, event_global_data_initialized, event_command_completed,
@@ -363,12 +459,19 @@ try:
     t_comm.start()
     t_soc.start()
     t_internal_chargepoint.start()
+    instant_trigger.start(host="localhost", port=1886)
     Thread(target=start_modbus_server, args=(event_modbus_server,), name="Modbus Control Server").start()
     # Warten, damit subdata Zeit hat, alle Topics auf dem Broker zu empfangen.
     event_update_config_completed.wait(300)
     event_subdata_initialized.wait(300)
     Pub().pub("openWB/set/system/boot_done", True)
     Path(Path(__file__).resolve().parents[1]/"ramdisk"/"bootdone").touch()
+    # Start the LoadvarsRunner now that subdata is initialised. The runner
+    # immediately kicks off its first phase-A cycle so that the initial
+    # boot-time handler10Sec call below has a fresh snapshot to work with.
+    if DECOUPLED_LOADVARS:
+        loadvars_runner = LoadvarsRunner(loadvars_)
+        loadvars_runner.start()
     schedule_jobs()
     if event_jobs_running.is_set():
         # Nach dem Starten als erstes den 10Sek-Handler aufrufen, damit die Werte der data.data initialisiert werden.
@@ -382,7 +485,22 @@ while True:
             schedule_jobs()
         elif event_jobs_running.is_set() is False and len(schedule.get_jobs("algorithm")) > 0:
             schedule.clear("algorithm")
+
+        # Wake either after 1 s (periodic poll cadence) or as soon as
+        # InstantTrigger sets the event for an immediate algorithm run.
+        triggered = event_trigger_algorithm.wait(timeout=1.0)
+        if triggered:
+            event_trigger_algorithm.clear()
+            if event_jobs_running.is_set():
+                if handler._active:
+                    # A periodic tick is mid-run; re-arm so the next 1 s
+                    # wake-up tries again once the lock is released.
+                    event_trigger_algorithm.set()
+                else:
+                    _resync_algorithm_schedule()
+
+        # Single call site for handler10Sec — runs both the rescheduled
+        # instant tick and any other due periodic work.
         schedule.run_pending()
-        time.sleep(1)
     except Exception:
         log.exception("Fehler im Main-Modul")

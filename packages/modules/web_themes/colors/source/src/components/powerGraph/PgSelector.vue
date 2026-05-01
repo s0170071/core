@@ -46,10 +46,14 @@
 			<span
 				v-if="editmode < 2"
 				type="button"
-				class="btn-outline-secondary p-2 px-3 badge rounded-pill datebadge"
+				class="btn-outline-secondary p-2 px-3 badge rounded-pill datebadge date-slot"
 				@click="toggleEdit"
 			>
-				{{ displayDate }}
+				<!-- invisible reservoir reserves width of widest possible label -->
+				<span class="date-slot__ghost" aria-hidden="true">{{
+					widestLabel
+				}}</span>
+				<span class="date-slot__value">{{ displayDate }}</span>
 			</span>
 			<DateInput
 				v-if="editmode == 2"
@@ -147,6 +151,11 @@ const displayDate = computed(() => {
 })
 const graphmodes = ['live', 'today', 'day', 'month', 'year']
 const modenames = ['Live', 'Heute', 'Tag', 'Monat', 'Jahr']
+// Widest realistic label across all graph modes ("September 2026" beats
+// "Lädt", "heute", "DD.MM.", year, and live-duration variants in any locale
+// using the current font). Used as an invisible width reservoir to prevent
+// layout shift when displayDate changes.
+const widestLabel = 'September 2026'
 
 const gmode = computed({
 	get() {
@@ -258,6 +267,20 @@ const row2layout = computed(() => {
 	border: 1px solid var(--color-menu);
 	font-size: var(--font-small);
 	font-weight: normal;
+}
+.date-slot {
+	display: inline-grid;
+	justify-items: center;
+	align-items: center;
+}
+.date-slot__ghost,
+.date-slot__value {
+	grid-area: 1 / 1;
+	white-space: nowrap;
+}
+.date-slot__ghost {
+	visibility: hidden;
+	pointer-events: none;
 }
 .arrowButton {
 	color: var(--color-menu);
