@@ -260,8 +260,13 @@ class Ev:
                                        get_power: float,
                                        max_current_cp: int,
                                        limit: LoadmanagementLimit) -> Tuple[bool, Optional[str]]:
-        # Manche EV laden mit 6.1A bei 6A Soll-Strom
-        min_current = max(control_parameter.min_current, control_parameter.required_current)
+        # For the 3→1 condition, use the template minimum current (not the algorithm's
+        # required_current). Using required_current causes premature 3→1 switches during PV
+        # charging: the surplus algorithm tracks available power (e.g. 9A), and with
+        # nominal_difference the threshold becomes 11A — so any transient surplus dip triggers
+        # the switch even though the car is well above minimum (6A). The algorithm should first
+        # reduce current toward min_current before considering a phase switch.
+        min_current = control_parameter.min_current
         min_current_range = min_current + self.ev_template.data.nominal_difference
         max_current = min(self.ev_template.data.max_current_single_phase, max_current_cp)
         max_current_range = max_current - self.ev_template.data.nominal_difference

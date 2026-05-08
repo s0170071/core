@@ -38,30 +38,9 @@ class SetData:
         self.heartbeat = False
         # Per-CP memory of the last observed chargemode, used to suppress
         # duplicate `set/charge_template` publishes (algorithm re-publishes,
-        # GUI/API echoes, etc.) so the relay log and stop-shortcut only
-        # fire on actual user-initiated chargemode transitions.
+        # GUI/API echoes, etc.) so the relay log only fires on actual
+        # user-initiated chargemode transitions.
         self._last_chargemode = {}  # type: dict
-
-    def _stop_shortcut(self, cp_num) -> None:
-        """When the user picks 'stop', publish set/current=0 immediately so
-        the EVSE relay drops without waiting for the next algorithm tick.
-        The chargemode itself is pushed into the live tree by
-        `_apply_chargemode_to_live_tree`, called for every chargemode change.
-        """
-        try:
-            Pub().pub(f"openWB/set/chargepoint/{cp_num}/set/current", 0)
-            evse_relay_log.info(
-                f"CP{cp_num}: stop-shortcut \u2192 set/current=0 (bypassing algorithm tick)")
-        except Exception:
-            log.exception("stop-shortcut failed")
-        try:
-            cp = data.data.cp_data.get(f"cp{cp_num}")
-            if cp is not None:
-                # Also zero the staged set current so the algorithm doesn't
-                # immediately re-publish the previous value either.
-                cp.data.set.current = 0
-        except Exception:
-            log.exception("stop-shortcut: failed to zero live set.current")
 
     def _apply_chargemode_to_live_tree(self, cp_num, mode: str) -> None:
         """Push the new chargemode into the live data tree for the given CP
@@ -484,8 +463,6 @@ class SetData:
                             # operate on the previous mode.
                             if _mode:
                                 self._apply_chargemode_to_live_tree(_cp_idx, _mode)
-                            if _mode == "stop":
-                                self._stop_shortcut(_cp_idx)
                     except Exception:
                         evse_relay_log.info(f"charge_template button: {msg.topic}")
                 if data.data.general_data.data.temporary_charge_templates_active is False:
