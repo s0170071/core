@@ -285,6 +285,24 @@ class Ev:
                             phases_in_use == 1)
         condition_3_to_1 = get_medium_charging_current(
             get_currents) < min_current_range and all_surplus <= 0 and phases_in_use > 1
+        # Suppress 3→1 while the house battery still has reserve in MIN_SOC_BAT mode.
+        # The bat_all ASSIST state will provide discharge power to sustain min_current on
+        # the current phase count; we only want to phase-switch once the battery is
+        # actually depleted (PROTECT state engaged).
+        if condition_3_to_1:
+            try:
+                bat_all = data.data.bat_all_data
+                pv_cfg = data.data.general_data.data.chargemode_config.pv_charging
+                if (bat_all.data.config.configured
+                        and pv_cfg.bat_mode == "min_soc_bat_mode"
+                        and not bat_all.data.set.protect_active
+                        and bat_all.data.get.soc > pv_cfg.min_bat_soc):
+                    log.debug(
+                        f"3→1 Phasenumschaltung unterdrückt: Speicher-SoC {bat_all.data.get.soc}% > "
+                        f"min_bat_soc {pv_cfg.min_bat_soc}% (ASSIST stützt min_current).")
+                    condition_3_to_1 = False
+            except Exception:
+                log.exception("Fehler bei Speicher-Gating der Phasenumschaltung")
         if condition_1_to_3 or condition_3_to_1:
             return True, None
         else:

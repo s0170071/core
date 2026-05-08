@@ -265,6 +265,13 @@ class BatAll:
                     if power < 0:
                         charging_power_left = power
                         self.data.set.regulate_up = True
+                    elif soc >= max_soc and power > 0:
+                        # OVERFLOW: battery is "full" per user config but still absorbing
+                        # PV. Expose that PV as available surplus so the car can take it
+                        # instead of letting the battery hoard energy above max_bat_soc.
+                        charging_power_left = power
+                        log.debug(f"MIN_SOC_BAT OVERFLOW: soc={soc}% >= max_soc={max_soc}%, "
+                                  f"battery charging at {power}W exposed as surplus, cpl={charging_power_left}W")
                     else:
                         charging_power_left = 0
                     log.debug(f"MIN_SOC_BAT PRIORITY: power={power}W, cpl={charging_power_left}W, "
