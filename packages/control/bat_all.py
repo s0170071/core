@@ -232,10 +232,12 @@ class BatAll:
                     self.data.set.protect_active = False
 
                 if self.data.set.protect_active:
-                    # STATE: PROTECT — starve car, charge battery
-                    charging_power_left = -5000
-                    self.data.set.regulate_up = True
-                    log.debug(f"MIN_SOC_BAT PROTECT: soc={soc}%, cpl={charging_power_left}W")
+                    # STATE: PROTECT — battery priority, but EV may use genuine grid export.
+                    # regulate_up is NOT set: the battery is already absorbing all it can (export proves
+                    # its charge rate is saturated), so we don't need to artificially starve the EV.
+                    # The normal control_range_offset is preserved so switch_on_threshold is reachable.
+                    charging_power_left = 0
+                    log.debug(f"MIN_SOC_BAT PROTECT: soc={soc}%, cpl={charging_power_left}W (export still usable)")
 
                 elif self.data.set.assist_active:
                     # STATE: ASSIST (latched) — battery helps car
