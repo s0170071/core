@@ -493,14 +493,21 @@ class Counter:
             # Wurde die Abschaltschwelle ggf. durch die Verzögerung anderer LP erreicht?
             min_current = (chargepoint.data.control_parameter.min_current
                            + charging_ev_data.ev_template.data.nominal_difference)
-            switch_off_condition = (power_in_use > threshold or
-                                    # Wenn der Speicher hochregeln soll, muss auch abgeschaltet werden.
-                                    (self.calc_raw_surplus() <= 0 and
+            actual_current = get_medium_charging_current(chargepoint.data.get.currents)
+            regulate_up_condition = (self.calc_raw_surplus() <= 0 and
                                      data.data.bat_all_data.data.set.regulate_up and
                                      # Einen nach dem anderen abschalten, bis Ladeleistung des Speichers erreicht ist
                                      # und wieder eingespeist wird.
-                                     self.data.set.reserved_surplus == 0))
-            if switch_off_condition and get_medium_charging_current(chargepoint.data.get.currents) <= min_current:
+                                     self.data.set.reserved_surplus == 0)
+            # For the surplus-threshold path, use min_current + nominal_difference (allows for measurement
+            # tolerance). For the regulate_up path, use strict min_current: the algorithm must first reduce
+            # the EV to its hardware minimum before the battery switch-off fires; otherwise a transient
+            # battery discharge at e.g. 7.3A (< 8A = min+nominal) prematurely cuts power and oscillates.
+            switch_off_condition = ((power_in_use > threshold and actual_current <= min_current) or
+                                    # Wenn der Speicher hochregeln soll, muss auch abgeschaltet werden.
+                                    (regulate_up_condition and
+                                     actual_current <= chargepoint.data.control_parameter.min_current))
+            if switch_off_condition:
                 if not charging_ev_data.ev_template.data.prevent_charge_stop:
                     # EV, die ohnehin nicht laden, wird direkt die Ladefreigabe entzogen.
                     # Würde man required_power vom released_evu_surplus subtrahieren, würden keine anderen EVs
