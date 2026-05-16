@@ -106,12 +106,13 @@ class ChargepointModule(AbstractChargepoint):
             log.exception("CP%d: Failed to release CP safety stop via GPIO%d",
                           self.local_charge_point_num, gpio_cp)
 
-    def set_current(self, current: float) -> None:
+    def set_current(self, current: float, force: bool = False) -> None:
         with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            self._client.evse_client.set_current(current, phases_in_use=self.old_phases_in_use)
+            self._client.evse_client.set_current(current, phases_in_use=self.old_phases_in_use, force=force)
         if current != self._last_current_logged:
-            evse_relay_log.info("CP%d: evse_current=%.1fA phases=%d",
-                                self.local_charge_point_num, current, self.old_phases_in_use)
+            evse_relay_log.info("CP%d: evse_current=%.1fA phases=%d%s",
+                                self.local_charge_point_num, current, self.old_phases_in_use,
+                                " [forced]" if force else "")
             self._last_current_logged = current
 
     def get_values(self, phase_switch_cp_active: bool, last_tag: str) -> ChargepointState:
@@ -190,12 +191,12 @@ class ChargepointModule(AbstractChargepoint):
         evse = self._client.evse_client
         cp = self.local_charge_point_num
         with SingleComponentUpdateContext(self.fault_state, update_always=False, reraise=True):
-            evse.set_current(0)  # stop charging before switching phases
+            evse.set_current(0, force=True)  # stop charging before switching phases (bypass debounce)
             for _ in range(20):  # poll up to 10s (20 × 0.5s) for EVSE to confirm 0 A
                 if _read_evse_current_from_hardware(evse) == 0:
                     break
                 time.sleep(0.5)
-                evse.set_current(0)  # send stop command again
+                evse.set_current(0, force=True)  # send stop command again
             else:
                 raise Exception("Ladung konnte nicht gestoppt werden - Phasenumschaltung abgebrochen.")
         safe_relay_output(gpio_cp, GPIO.HIGH, evse, cp_num=cp)  # CP off
@@ -212,7 +213,7 @@ class ChargepointModule(AbstractChargepoint):
         evse = self._client.evse_client
         cp = self.local_charge_point_num
         with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            evse.set_current(0)
+            evse.set_current(0, force=True)  # CP interruption: bypass debounce
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BOARD)
         GPIO.setup(gpio_cp, GPIO.OUT)

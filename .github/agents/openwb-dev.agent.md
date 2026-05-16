@@ -109,6 +109,8 @@ src/
 4. MQTT topics: `openWB/vehicle/{id}/current_offset` (per-vehicle), `openWB/vehicle/template/ev_template/{id}` (template)
 5. UI subscribes via wildcard `openWB/vehicle/+/current_offset` etc.
 6. `BatAll._get_charging_power_left()` → state machine (PROTECT/PRIORITY/ASSIST) → `charging_power_left` → `counter.calc_surplus()` / `calc_raw_surplus()`
+7. **Phase switching data flow:** `bat_all.power_for_bat_charging()` → `counter.calc_surplus()` → `counter.get_usable_surplus()` → `ev._check_phase_switch_conditions()` → `ev.auto_phase_switch()` → `chargepoint.set_phases()`
+8. **Phase switching decision in `chargepoint.get_phases_by_selected_chargemode()`:** runs every tick BEFORE the algorithm. For PV mode (`phases_chargemode == 0`), defaults to 1-phase when not charging. When charging, uses `phases_in_use`. Preserves `control_parameter.phases` in `CHARGING_STATES` to prevent overwriting algorithm decisions.
 
 ## Deployment Workflow
 
@@ -162,6 +164,18 @@ ssh openwb@192.168.1.20 "cd /var/www/html/openWB && python3 -m pytest packages/ 
 
 - `openwb-ui-settings/src/store/index.js` — added `examples: {}` to initial state to prevent `'in' operator` crash on `updateTopic` in production builds
 
+### Phase switch oscillation fix (`ev.py`, `chargepoint.py`)
+
+**Root cause:** `_check_phase_switch_conditions()` in `ev.py` used `max(min_current, required_current)` for the 3→1 threshold. During PV charging, `required_current` tracks the algorithm's target (~9A at 3-phase), making `min_current_range = 9 + nominal_difference(2) = 11`. With the car charging at 9A × 3 phases, any transient surplus dip triggered a premature 3→1 switch. After switching to 1-phase, surplus recovered (less power used), triggering 1→3 again — creating a ~5-minute oscillation cycle.
+
+**Fix:** Changed to use only `control_parameter.min_current` (template minimum, typically 6A). The 3→1 switch now only triggers when current is actually near the hardware minimum AND surplus is negative — meaning the algorithm has already reduced current as far as possible.
+
+**Also fixed:** `get_phases_by_selected_chargemode()` in `chargepoint.py` — added guard for `CHARGING_STATES` with `control_parameter.phases > 1` to prevent the every-tick phase recalculation from overwriting the algorithm's phase commitment after a successful switch.
+
+**Files changed:**
+- `packages/control/ev/ev.py` — `_check_phase_switch_conditions()` threshold fix
+- `packages/control/chargepoint/chargepoint.py` — `get_phases_by_selected_chargemode()` CHARGING_STATES guard
+
 ### MQTT access topics
 
 - Published retained `openWB/system/security/access/{PageName}` = `true` for all 13 routes via port 1884 (the default port 1883 ACL blocks writes to `openWB/system/` for anonymous clients)
@@ -179,3 +193,6 @@ ssh openwb@192.168.1.20 "cd /var/www/html/openWB && python3 -m pytest packages/ 
 - **UI repo branch:** Use `main` but check for incompatible PRs (e.g. user-management merge at `5d1fb7e` adds access guards the backend doesn't support). Current working commit: `ba457f7`
 - **Device SSH key:** `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOOSp6X70Xgj6bTUFzOP84MT5Di8doc0ST8dEvHi45bb` — not registered with GitHub (push from Windows instead)
 - **PowerShell stderr:** Native commands writing to stderr cause `NativeCommandError` when `$ErrorActionPreference = 'Stop'` — wrap SSH calls with `$ErrorActionPreference = 'Continue'`
+- **Phase switch oscillation pattern:** If logs show repeated `Umschaltung von 1 auf 3` / `Umschaltung von 3 auf 1` every ~5 min, check `_check_phase_switch_conditions()` thresholds. The 3→1 condition uses `min_current + nominal_difference` — if this is set too high (e.g. by using `required_current` instead of `min_current`), surplus transients cause premature switches
+- **`get_phases_by_selected_chargemode` runs every tick:** This method determines `phases_to_use` BEFORE the algorithm runs. For PV mode, it must preserve phase commitments made by the algorithm/switch-on logic. States to guard: all `CHARGING_STATES`, not just `WAIT_FOR_USING_PHASES`
+- **Battery changes don't affect phase switching:** `bat_all` changes (ASSIST formula, i_term removal) feed into surplus via `power_for_bat_charging()` → `calc_surplus()` → `get_usable_surplus()`. The ASSIST fix (`discharge_rate + min(0, power)`) makes surplus more conservative, reducing oscillation risk

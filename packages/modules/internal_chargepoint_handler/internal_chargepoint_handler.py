@@ -56,18 +56,43 @@ class UpdateState:
                 log.debug("Thread zur CP-Unterbrechung an LP"+str(self.cp_module.local_charge_point_num) +
                           " noch aktiv. Es muss erst gewartet werden, bis die CP-Unterbrechung abgeschlossen ist.")
                 return
-        self.cp_module.set_current(set_current)
+        # heartbeat_expired is an explicit safety stop — must bypass the EVSE zero-write
+        # debounce so the car is actually stopped immediately.
+        self.cp_module.set_current(set_current, force=heartbeat_expired)
         if not self.is_local:
             pub_single(f"openWB/set/chargepoint/{self.hierarchy_id}/set/current", payload=set_current)
         if data.trigger_phase_switch:
             log.debug("Switch Phases from "+str(self.old_phases_to_use) + " to " + str(data.phases_to_use))
+            # Clear the trigger flag synchronously in SubData and in the local snapshot BEFORE
+            # starting the worker thread. The MQTT publish below is a round-trip through the
+            # broker and won't update SubData before the next ~1.1s loop tick takes its next
+            # snapshot. Without the in-memory clear, the next tick re-reads `True`, sees the
+            # already-finished worker thread (phase switch sequence is ~0.9s, shorter than the
+            # tick period), and fires a second, duplicate phase switch — visible in the logs
+            # as two CP/relay pulse sequences ~1s apart.
+            cp_key = f"cp{self.cp_module.local_charge_point_num}"
+            try:
+                SubData.internal_chargepoint_data[cp_key].data.trigger_phase_switch = False
+            except (KeyError, AttributeError):
+                log.exception("Konnte trigger_phase_switch nicht synchron in SubData zurücksetzen.")
+            data.trigger_phase_switch = False
             self.__thread_phase_switch(data.phases_to_use)
             pub.pub_single(
                 f"openWB/set/internal_chargepoint/{self.cp_module.local_charge_point_num}/data/trigger_phase_switch",
                 False)
 
         if data.cp_interruption_duration > 0:
-            self.__thread_cp_interruption(data.cp_interruption_duration)
+            # Same race as trigger_phase_switch above: clear in SubData + local snapshot before
+            # spawning the worker, so the next tick doesn't see the stale non-zero duration and
+            # fire a duplicate CP interruption.
+            duration = data.cp_interruption_duration
+            cp_key = f"cp{self.cp_module.local_charge_point_num}"
+            try:
+                SubData.internal_chargepoint_data[cp_key].data.cp_interruption_duration = 0
+            except (KeyError, AttributeError):
+                log.exception("Konnte cp_interruption_duration nicht synchron in SubData zurücksetzen.")
+            data.cp_interruption_duration = 0
+            self.__thread_cp_interruption(duration)
 
     def __thread_phase_switch(self, phases_to_use: int) -> None:
         self.phase_switch_thread = Thread(

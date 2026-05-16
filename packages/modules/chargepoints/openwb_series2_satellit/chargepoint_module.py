@@ -123,7 +123,10 @@ class ChargepointModule(AbstractChargepoint):
 
     def set_current(self, current: float) -> None:
         if self.version is not None:
-            if self.client_error_context.error_counter_exceeded():
+            # Safety stop: communication errors exceeded threshold — force 0 A immediately,
+            # bypassing the EVSE zero-write debounce.
+            error_stop = self.client_error_context.error_counter_exceeded()
+            if error_stop:
                 current = 0
             with SingleComponentUpdateContext(self.fault_state, update_always=False):
                 with self.client_error_context:
@@ -131,9 +134,10 @@ class ChargepointModule(AbstractChargepoint):
                         self.delay_second_cp(self.CP1_DELAY)
                         with self._client.client:
                             if self.version:
-                                self._client.evse_client.set_current(current)
+                                self._client.evse_client.set_current(current, force=error_stop)
                             else:
-                                self._client.evse_client.set_current(0)
+                                # Unknown firmware / version not validated — explicit safety stop.
+                                self._client.evse_client.set_current(0, force=True)
                     except AttributeError:
                         self._create_client()
                         self._validate_version()
@@ -144,7 +148,8 @@ class ChargepointModule(AbstractChargepoint):
                 with self.client_error_context:
                     try:
                         with self._client.client:
-                            self._client.evse_client.set_current(0)
+                            # Phase-switch stop must bypass the EVSE zero-write debounce.
+                            self._client.evse_client.set_current(0, force=True)
                             time.sleep(0.5)
                             if phases_to_use == 1:
                                 self._client.client.delegate.write_register(
