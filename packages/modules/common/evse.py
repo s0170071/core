@@ -54,8 +54,12 @@ class Evse:
         # which prevents very brief enable/disable cycles seen with borderline PV surplus.
         # Phase switches and CP interruptions bypass this via force=True.
         self._last_nonzero_write_ts = 0.0
+        # Debounce: timestamp of the last zero current write. Used to suppress
+        # repeated zero-writes within ZERO_ZERO_DEBOUNCE_S, preventing relay loop cycles.
+        self._last_zero_write_ts = 0.0
 
     ZERO_WRITE_DEBOUNCE_S = 60.0
+    ZERO_ZERO_DEBOUNCE_S = 300.0
 
     def get_plug_charge_state(self) -> Tuple[bool, bool, float]:
         time.sleep(0.1)
@@ -132,14 +136,22 @@ class Evse:
             now = time.time()
             # Low-level debounce: refuse to write 0 if a non-zero value was written less than
             # ZERO_WRITE_DEBOUNCE_S ago, unless force=True (used by phase switch / CP interruption).
-            if (formatted_current == 0
-                    and not force
-                    and self._last_nonzero_write_ts > 0
-                    and (now - self._last_nonzero_write_ts) < self.ZERO_WRITE_DEBOUNCE_S):
-                evse_relay_log.info(
-                    "EVSE id=%d: zero-write suppressed (%.1fs since last non-zero, debounce=%.0fs)",
-                    self.id, now - self._last_nonzero_write_ts, self.ZERO_WRITE_DEBOUNCE_S)
-                return
+            if formatted_current == 0 and not force:
+                if (self._last_nonzero_write_ts > 0
+                        and (now - self._last_nonzero_write_ts) < self.ZERO_WRITE_DEBOUNCE_S):
+                    evse_relay_log.info(
+                        "EVSE id=%d: zero-write suppressed (%.1fs since last non-zero, debounce=%.0fs)",
+                        self.id, now - self._last_nonzero_write_ts, self.ZERO_WRITE_DEBOUNCE_S)
+                    return
+                if (self._last_zero_write_ts > 0
+                        and (now - self._last_zero_write_ts) < self.ZERO_ZERO_DEBOUNCE_S):
+                    evse_relay_log.info(
+                        "EVSE id=%d: zero-write suppressed (%.1fs since last zero-write, debounce=%.0fs)",
+                        self.id, now - self._last_zero_write_ts, self.ZERO_ZERO_DEBOUNCE_S)
+                    return
+            
+            
+            
             self.client.write_registers(1000, formatted_current, unit=self.id)
             evse_relay_log.info("EVSE id=%d: set_current %.2fA (reg=%d, prev_reg=%d)%s",
                                self.id, current, formatted_current, self.evse_current,
@@ -147,6 +159,8 @@ class Evse:
             self.evse_current = formatted_current
             if formatted_current != 0:
                 self._last_nonzero_write_ts = now
+            else:
+                self._last_zero_write_ts = now
             is_zero = formatted_current == 0
             if self._last_was_zero is not None and is_zero != self._last_was_zero:
                 self._toggle_timestamps = [t for t in self._toggle_timestamps if now - t < 120]

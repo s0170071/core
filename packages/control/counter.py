@@ -433,8 +433,17 @@ class Counter:
                         pv_config.switch_off_delay):
                     control_parameter.timestamp_switch_on_off = None
                     self.data.set.released_surplus -= chargepoint.data.set.required_power
-                    msg = self.SWITCH_OFF_STOP
-                    control_parameter.state = ChargepointState.NO_CHARGING_ALLOWED
+                    if (data.data.bat_all_data.data.config.configured and
+                            data.data.bat_all_data.data.get.soc > pv_config.min_bat_soc):
+                        # Battery is above min SoC and will cover the deficit automatically.
+                        # Keep the car charging at min current instead of cutting it off.
+                        log.info(f"LP{chargepoint.num}: Abschaltverzögerung abgelaufen, "
+                                 f"aber Speicher-SoC {data.data.bat_all_data.data.get.soc}% > "
+                                 f"min SoC {pv_config.min_bat_soc}% — Ladung wird fortgesetzt.")
+                        control_parameter.state = ChargepointState.CHARGING_ALLOWED
+                    else:
+                        msg = self.SWITCH_OFF_STOP
+                        control_parameter.state = ChargepointState.NO_CHARGING_ALLOWED
                 else:
                     msg = self.SWITCH_OFF_WAITING.format(timecheck.convert_timestamp_delta_to_time_string(
                         control_parameter.timestamp_switch_on_off, pv_config.switch_off_delay))
