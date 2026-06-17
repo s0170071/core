@@ -17,10 +17,12 @@ from dataclass_utils.factories import currents_list_factory, voltages_list_facto
 from helpermodules import timecheck
 from helpermodules.constants import NO_ERROR
 from helpermodules.phase_handling import convert_cp_currents_to_evu_currents
+from helpermodules.hardware_configuration import get_hardware_configuration_setting
 from modules.common.fault_state import FaultStateLevel
 from modules.common.utils.component_parser import get_component_name_by_id
 
 log = logging.getLogger(__name__)
+evse_relay_log = logging.getLogger("evse_relay")
 
 
 def get_counter_default_config():
@@ -433,10 +435,19 @@ class Counter:
                         pv_config.switch_off_delay):
                     control_parameter.timestamp_switch_on_off = None
                     self.data.set.released_surplus -= chargepoint.data.set.required_power
+                    lat = get_hardware_configuration_setting("latitude", 48.89)
+                    lon = get_hardware_configuration_setting("longitude", 9.19)
+                    longbeforeSunset = timecheck.is_long_before_sunset(lat, lon)
                     if (data.data.bat_all_data.data.config.configured and
-                            data.data.bat_all_data.data.get.soc > pv_config.min_bat_soc):
+                            data.data.bat_all_data.data.get.soc > pv_config.min_bat_soc and
+                            longbeforeSunset):
+
                         # Battery is above min SoC and will cover the deficit automatically.
                         # Keep the car charging at min current instead of cutting it off.
+                        evse_relay_log.info(f"LP{chargepoint.num}: Abschaltverzögerung abgelaufen, >1h vor Sonnenuntergang, "
+                                f"aber Speicher-SoC {data.data.bat_all_data.data.get.soc}% > "
+                                f"min SoC {pv_config.min_bat_soc}% — Ladung wird fortgesetzt.")
+
                         log.info(f"LP{chargepoint.num}: Abschaltverzögerung abgelaufen, "
                                  f"aber Speicher-SoC {data.data.bat_all_data.data.get.soc}% > "
                                  f"min SoC {pv_config.min_bat_soc}% — Ladung wird fortgesetzt.")

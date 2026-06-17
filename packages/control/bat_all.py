@@ -207,13 +207,16 @@ class BatAll:
                     charging_power_left = self.data.get.power
                 else:
                     charging_power_left = 0
-                # Treat the battery as "full" once it reaches the configured max SoC,
-                # not at a hardcoded 100%. Otherwise regulate_up stays True forever
-                # (chargers see -100W reserve + forced switch-off when raw_surplus<=0)
-                # and PV charging will not start even though the battery is full per
-                # the user's configuration.
+                # Only force regulate_up when the battery is actively discharging (power < 0).
+                # A discharging battery with soc < max_bat_soc genuinely needs the algorithm to
+                # create surplus so it can recover. When the battery is idle (power == 0) or
+                # charging (power > 0) it is already buffering PV fluctuations by itself —
+                # setting regulate_up=True in those states adds a spurious -100W bat_surplus penalty
+                # that inflates calc_surplus(), prevents switch-off-timers from cancelling after PV
+                # recovers, and can produce needless 0A writes even when the battery would and
+                # should absorb any momentary grid draw.
                 self.data.set.regulate_up = (
-                    True if self.data.get.soc < config.max_bat_soc else False)
+                    True if self.data.get.soc < config.max_bat_soc and self.data.get.power < 0 else False)
             elif config.bat_mode == BatConsiderationMode.EV_MODE.value:
                 charging_power_left = self.data.get.power
             else:

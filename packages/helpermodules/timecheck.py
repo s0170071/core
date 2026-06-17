@@ -2,6 +2,7 @@
 """
 import logging
 import datetime
+import math
 import re
 from typing import List, Optional, Tuple, TypeVar, Union
 
@@ -12,6 +13,105 @@ with ImportErrorContext():
 from helpermodules.abstract_plans import AutolockPlan, ScheduledChargingPlan, TimeChargingPlan
 
 log = logging.getLogger(__name__)
+
+
+def _calc_sun_times_utc(
+        lat: float, lon: float, date: datetime.date
+) -> Tuple[Optional[datetime.time], Optional[datetime.time]]:
+    """Calculate UTC sunrise and sunset for *date* at (*lat*, *lon*) using the
+    NOAA simplified solar-position algorithm (stdlib only).
+
+    Returns (sunrise_utc, sunset_utc) as :class:`datetime.time` objects, or
+    ``(None, None)`` for polar day / polar night conditions.
+    """
+    # Julian day number
+    a = (14 - date.month) // 12
+    y = date.year + 4800 - a
+    m = date.month + 12 * a - 3
+    jd = (date.day + (153 * m + 2) // 5 + 365 * y
+          + y // 4 - y // 100 + y // 400 - 32045)
+
+    # Julian centuries since J2000.0
+    jc = (jd - 2451545.0) / 36525.0
+
+    # Geometric mean longitude and anomaly (degrees)
+    L0 = (280.46646 + jc * (36000.76983 + jc * 0.0003032)) % 360
+    M = 357.52911 + jc * (35999.05029 - 0.0001537 * jc)
+
+    # Equation of center and sun's true / apparent longitude
+    e = 0.016708634 - jc * (0.000042037 + 0.0000001267 * jc)
+    C = (math.sin(math.radians(M)) * (1.9146 - jc * (0.004817 + 0.000014 * jc))
+         + math.sin(math.radians(2 * M)) * (0.019993 - 0.000101 * jc)
+         + math.sin(math.radians(3 * M)) * 0.00029)
+    omega = 125.04 - 1934.136 * jc
+    app_lon = L0 + C - 0.00569 - 0.00478 * math.sin(math.radians(omega))
+
+    # Corrected obliquity and sun's declination
+    mean_obl = 23.0 + (26.0 + (21.448 - jc * (46.815 + jc * (0.00059 - jc * 0.001813))) / 60.0) / 60.0
+    obl_corr = mean_obl + 0.00256 * math.cos(math.radians(omega))
+    dec = math.degrees(math.asin(math.sin(math.radians(obl_corr)) * math.sin(math.radians(app_lon))))
+
+    # Equation of time (minutes)
+    y_val = math.tan(math.radians(obl_corr / 2.0)) ** 2
+    eq_time = 4.0 * math.degrees(
+        y_val * math.sin(2.0 * math.radians(L0))
+        - 2.0 * e * math.sin(math.radians(M))
+        + 4.0 * e * y_val * math.sin(math.radians(M)) * math.cos(2.0 * math.radians(L0))
+        - 0.5 * y_val ** 2 * math.sin(4.0 * math.radians(L0))
+        - 1.25 * e ** 2 * math.sin(2.0 * math.radians(M))
+    )
+
+    # Hour angle for 90.833° zenith (refraction + solar disc radius)
+    lat_r = math.radians(lat)
+    dec_r = math.radians(dec)
+    cos_ha = (math.cos(math.radians(90.833)) / (math.cos(lat_r) * math.cos(dec_r))
+              - math.tan(lat_r) * math.tan(dec_r))
+    if cos_ha < -1.0 or cos_ha > 1.0:
+        return None, None  # polar day or polar night
+    ha = math.degrees(math.acos(cos_ha))
+
+    # Solar noon UTC (minutes from midnight) and rise/set
+    solar_noon_utc = 720.0 - 4.0 * lon - eq_time
+    sunrise_min = solar_noon_utc - ha * 4.0
+    sunset_min = solar_noon_utc + ha * 4.0
+
+    def _min_to_time(m: float) -> datetime.time:
+        m = m % 1440
+        if m < 0:
+            m += 1440
+        hh = int(m // 60) % 24
+        mm = int(m % 60)
+        ss = int((m % 1) * 60)
+        return datetime.time(hh, mm, ss)
+
+    return _min_to_time(sunrise_min), _min_to_time(sunset_min)
+
+
+def is_long_before_sunset(lat: float, lon: float, minutes_before_sunset: int = 60) -> bool:
+    """Return ``True`` when the current UTC time is between sunrise and
+    *minutes_before_sunset* minutes before sunset, ``False`` otherwise
+    (i.e. before sunrise, within the final *minutes_before_sunset* minutes
+    before sunset, or after sunset).
+
+    Parameters
+    ----------
+    lat:
+        Decimal degrees latitude, positive = North.
+    lon:
+        Decimal degrees longitude, positive = East.
+    minutes_before_sunset:
+        Threshold in minutes before sunset at which the function starts
+        returning ``False`` (default 60).
+    """
+    now = datetime.datetime.utcnow()
+    sunrise, sunset = _calc_sun_times_utc(lat, lon, now.date())
+    if sunrise is None or sunset is None:
+        # Polar conditions — conservatively signal that the solar window is closed.
+        return False
+    now_min = now.hour * 60 + now.minute
+    sunrise_min = sunrise.hour * 60 + sunrise.minute
+    cutoff_min = sunset.hour * 60 + sunset.minute - minutes_before_sunset
+    return sunrise_min <= now_min <= cutoff_min
 
 
 def is_now_in_locking_time(now: datetime.datetime,
