@@ -33,6 +33,7 @@ class ChargepointModule(AbstractChargepoint):
                  internal_cp: InternalChargepoint,
                  hierarchy_id: int) -> None:
         self.local_charge_point_num = local_charge_point_num
+        self.hierarchy_id = hierarchy_id
         self.fault_state = FaultState(ComponentInfo(
             local_charge_point_num,
             "Ladepunkt "+str(local_charge_point_num),
@@ -107,9 +108,14 @@ class ChargepointModule(AbstractChargepoint):
                           self.local_charge_point_num, gpio_cp)
 
     def set_current(self, current: float, force: bool = False) -> None:
+        applied = False
         with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            self._client.evse_client.set_current(current, phases_in_use=self.old_phases_in_use, force=force)
-        if current != self._last_current_logged:
+            applied = self._client.evse_client.set_current(
+                current, phases_in_use=self.old_phases_in_use, force=force)
+        # Only log if the write was actually applied — if the EVSE-level debounce suppressed
+        # it, the EVSE current did not change, so logging `current` here would be misleading
+        # (it would look like a change happened when the write was in fact skipped).
+        if applied and current != self._last_current_logged:
             evse_relay_log.info("CP%d: evse_current=%.1fA phases=%d%s",
                                 self.local_charge_point_num, current, self.old_phases_in_use,
                                 " [forced]" if force else "")
@@ -168,6 +174,21 @@ class ChargepointModule(AbstractChargepoint):
                 current_branch=self.current_branch,
                 current_commit=self.current_commit
             )
+            if phases_in_use == 1:
+                measured_current = counter_state.currents[0]
+            elif phases_in_use == 2:
+                measured_current = (counter_state.currents[0] + counter_state.currents[1]) / 2
+            elif phases_in_use == 3:
+                measured_current = sum(counter_state.currents) / 3
+            else:
+                measured_current = 0
+            try:
+                soc = SubData.cp_data[f"cp{self.hierarchy_id}"].chargepoint.data.get.connected_vehicle.soc
+            except (KeyError, AttributeError):
+                soc = None
+            evse_relay_log.info("CP%d: measured_current=%.1fA set_current=%.1fA phases=%d soc=%s",
+                                self.local_charge_point_num, measured_current, evse_state.set_current,
+                                phases_in_use, soc if soc is not None else "NA")
         if self.client_error_context.error_counter_exceeded():
             if not self._cp_safety_asserted:
                 self._assert_cp_safety_stop()

@@ -435,26 +435,10 @@ class Counter:
                         pv_config.switch_off_delay):
                     control_parameter.timestamp_switch_on_off = None
                     self.data.set.released_surplus -= chargepoint.data.set.required_power
-                    lat = get_hardware_configuration_setting("latitude", 48.89)
-                    lon = get_hardware_configuration_setting("longitude", 9.19)
-                    longbeforeSunset = timecheck.is_long_before_sunset(lat, lon)
-                    if (data.data.bat_all_data.data.config.configured and
-                            data.data.bat_all_data.data.get.soc > pv_config.min_bat_soc and
-                            longbeforeSunset):
-
-                        # Battery is above min SoC and will cover the deficit automatically.
-                        # Keep the car charging at min current instead of cutting it off.
-                        evse_relay_log.info(f"LP{chargepoint.num}: Abschaltverzögerung abgelaufen, >1h vor Sonnenuntergang, "
-                                f"aber Speicher-SoC {data.data.bat_all_data.data.get.soc}% > "
-                                f"min SoC {pv_config.min_bat_soc}% — Ladung wird fortgesetzt.")
-
-                        log.info(f"LP{chargepoint.num}: Abschaltverzögerung abgelaufen, "
-                                 f"aber Speicher-SoC {data.data.bat_all_data.data.get.soc}% > "
-                                 f"min SoC {pv_config.min_bat_soc}% — Ladung wird fortgesetzt.")
-                        control_parameter.state = ChargepointState.CHARGING_ALLOWED
-                    else:
-                        msg = self.SWITCH_OFF_STOP
-                        control_parameter.state = ChargepointState.NO_CHARGING_ALLOWED
+                    # The battery-SoC guard now lives in switch_off_check_threshold; if the timer
+                    # actually expired the SoC was below min_bat_soc when the delay started.
+                    msg = self.SWITCH_OFF_STOP
+                    control_parameter.state = ChargepointState.NO_CHARGING_ALLOWED
                 else:
                     msg = self.SWITCH_OFF_WAITING.format(timecheck.convert_timestamp_delta_to_time_string(
                         control_parameter.timestamp_switch_on_off, pv_config.switch_off_delay))
@@ -540,13 +524,30 @@ class Counter:
                         msg = self.SWITCH_OFF_NOT_CHARGING
                         control_parameter.state = ChargepointState.NO_CHARGING_ALLOWED
                     else:
-                        timestamp_switch_on_off = timecheck.create_timestamp()
-                        # merken, dass ein LP verzögert wird, damit nicht zu viele LP verzögert werden.
-                        self.data.set.released_surplus += chargepoint.data.set.required_power
-                        msg = self.SWITCH_OFF_WAITING.format(timecheck.convert_timestamp_delta_to_time_string(
-                            timestamp_switch_on_off,
-                            data.data.general_data.data.chargemode_config.pv_charging.switch_off_delay))
-                        control_parameter.state = ChargepointState.SWITCH_OFF_DELAY
+                        # Guard: if the battery SoC is above the PV-charging minimum and there is
+                        # plenty of daylight left, the battery can cover the momentary deficit.
+                        # Don't start the switch-off timer — keep charging and let the surplus
+                        # algorithm reduce current naturally.
+                        lat = get_hardware_configuration_setting("latitude", 48.89)
+                        lon = get_hardware_configuration_setting("longitude", 9.19)
+                        if (data.data.bat_all_data.data.config.configured and
+                                data.data.bat_all_data.data.get.soc > pv_config.min_bat_soc and
+                                timecheck.is_long_before_sunset(lat, lon)):
+                            evse_relay_log.info(
+                                "LP%d: Abschaltschwelle erreicht, aber Speicher-SoC %.0f%% > "
+                                "min SoC %.0f%% — Abschaltverzögerung nicht gestartet, Ladung wird aufrechterhalten.",
+                                chargepoint.num, data.data.bat_all_data.data.get.soc, pv_config.min_bat_soc)
+                            log.info(
+                                "LP%d: switch-off timer suppressed — battery SoC %.0f%% > min_bat_soc %.0f%%",
+                                chargepoint.num, data.data.bat_all_data.data.get.soc, pv_config.min_bat_soc)
+                        else:
+                            timestamp_switch_on_off = timecheck.create_timestamp()
+                            # merken, dass ein LP verzögert wird, damit nicht zu viele LP verzögert werden.
+                            self.data.set.released_surplus += chargepoint.data.set.required_power
+                            msg = self.SWITCH_OFF_WAITING.format(timecheck.convert_timestamp_delta_to_time_string(
+                                timestamp_switch_on_off,
+                                data.data.general_data.data.chargemode_config.pv_charging.switch_off_delay))
+                            control_parameter.state = ChargepointState.SWITCH_OFF_DELAY
                     # Die Abschaltschwelle wird immer noch überschritten und es sollten weitere LP abgeschaltet
                     # werden.
                 else:

@@ -236,15 +236,21 @@ class BatAll:
 
                 if self.data.set.protect_active:
                     # STATE: PROTECT — soc <= min_soc, battery takes priority.
-                    # Behave like BAT_MODE: expose discharging power as negative cpl so the algorithm
-                    # reduces EV charging and the battery stops draining. If a reserve is configured,
-                    # only the surplus above the reserve is available to the EV.
+                    # When discharging: expose discharge power as negative cpl so the algorithm
+                    # reduces EV charging and the battery stops draining.
+                    # When charging: negate the battery's consumption (-power) as a "debt" so the
+                    # EV can only start if there is genuine PV export *beyond* what the battery is
+                    # already absorbing.  cpl=0 (previous behaviour) only gave a -100W regulate_up
+                    # penalty which was far too weak and allowed the EV to start whenever feed-in
+                    # exceeded 100W, even while the battery was still recovering min_soc.
+                    # Reserve: subtract reserve from the apparent charging power before negating so
+                    # battery power within the reserve budget still blocks the EV.
                     if power < 0:
                         charging_power_left = power
                     elif config.bat_power_reserve_active:
                         charging_power_left = power - config.bat_power_reserve
                     else:
-                        charging_power_left = 0
+                        charging_power_left = -power
                     self.data.set.regulate_up = (charging_power_left <= 0)
                     log.debug(f"MIN_SOC_BAT PROTECT: soc={soc}%, power={power}W, "
                               f"cpl={charging_power_left}W, regulate_up={self.data.set.regulate_up}")

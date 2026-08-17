@@ -93,7 +93,7 @@ cases = [
     Params("Mindest-SoC, SoC nicht erreicht, Speicher entlädt",
            PvCharging(bat_mode="min_soc_bat_mode"), -500, 40, -600, True),
     Params("Mindest-SoC, SoC nicht erreicht, Speicher lädt",
-           PvCharging(bat_mode="min_soc_bat_mode"), 500, 40, -100, True),
+           PvCharging(bat_mode="min_soc_bat_mode"), 500, 40, -600, True),
     Params("Mindest-SoC, SoC nicht erreicht, Speicher-Reserve, Speicher entlädt",
            PvCharging(bat_mode="min_soc_bat_mode", bat_power_reserve=2000, bat_power_reserve_active=True),
            -500, 40, -600, True),

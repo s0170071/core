@@ -87,7 +87,7 @@ def _calc_sun_times_utc(
     return _min_to_time(sunrise_min), _min_to_time(sunset_min)
 
 
-def is_long_before_sunset(lat: float, lon: float, minutes_before_sunset: int = 60) -> bool:
+def is_long_before_sunset(lat: float, lon: float, minutes_before_sunset: int = 150) -> bool:
     """Return ``True`` when the current UTC time is between sunrise and
     *minutes_before_sunset* minutes before sunset, ``False`` otherwise
     (i.e. before sunrise, within the final *minutes_before_sunset* minutes

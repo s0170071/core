@@ -58,8 +58,12 @@ class Evse:
         # repeated zero-writes within ZERO_ZERO_DEBOUNCE_S, preventing relay loop cycles.
         self._last_zero_write_ts = 0.0
 
-    ZERO_WRITE_DEBOUNCE_S = 60.0
+    ZERO_WRITE_DEBOUNCE_S = 300.0
     ZERO_ZERO_DEBOUNCE_S = 300.0
+    # Minimum off-time: suppress non-zero writes within this window of the last zero-write.
+    # Prevents the control loop from restarting charge immediately after a stop (e.g. 21-23s
+    # bounce-back seen when PV surplus oscillates around the start threshold).
+    NONZERO_WRITE_DEBOUNCE_S = 300.0
 
     def get_plug_charge_state(self) -> Tuple[bool, bool, float]:
         time.sleep(0.1)
@@ -124,7 +128,14 @@ class Evse:
         else:
             return
 
-    def set_current(self, current: int, phases_in_use: Optional[int] = None, force: bool = False) -> None:
+    def set_current(self, current: int, phases_in_use: Optional[int] = None, force: bool = False) -> bool:
+        """Write the requested current to the EVSE, subject to debounce rules.
+
+        Returns True if the value was actually written to the EVSE, False if the write
+        was suppressed by a debounce guard or the current already matched the target.
+        Callers must not assume the requested current was applied just because this was
+        called — they should check the return value before logging/acting as if it took effect.
+        """
         time.sleep(0.1)
         if self.max_current == 20 and phases_in_use is not None and phases_in_use != 0:
             # Bei 20A EVSE und bekannter Phasenzahl auf 16A begrenzen, sonst erstmal Ladung mit Minimalstrom starten,
@@ -134,6 +145,15 @@ class Evse:
         formatted_current = round(current*100) if self._precise_current else round(current)
         if self.evse_current != formatted_current:
             now = time.time()
+            # Low-level debounce: suppress non-zero writes if a zero was written less than
+            # NONZERO_WRITE_DEBOUNCE_S ago, preventing immediate bounce-back after a charge stop.
+            if formatted_current != 0 and not force:
+                if (self._last_zero_write_ts > 0
+                        and (now - self._last_zero_write_ts) < self.NONZERO_WRITE_DEBOUNCE_S):
+                    evse_relay_log.info(
+                        "EVSE id=%d: non-zero-write suppressed (%.1fs since last zero-write, min-off=%.0fs)",
+                        self.id, now - self._last_zero_write_ts, self.NONZERO_WRITE_DEBOUNCE_S)
+                    return False
             # Low-level debounce: refuse to write 0 if a non-zero value was written less than
             # ZERO_WRITE_DEBOUNCE_S ago, unless force=True (used by phase switch / CP interruption).
             if formatted_current == 0 and not force:
@@ -142,25 +162,30 @@ class Evse:
                     evse_relay_log.info(
                         "EVSE id=%d: zero-write suppressed (%.1fs since last non-zero, debounce=%.0fs)",
                         self.id, now - self._last_nonzero_write_ts, self.ZERO_WRITE_DEBOUNCE_S)
-                    return
+                    return False
                 if (self._last_zero_write_ts > 0
                         and (now - self._last_zero_write_ts) < self.ZERO_ZERO_DEBOUNCE_S):
                     evse_relay_log.info(
                         "EVSE id=%d: zero-write suppressed (%.1fs since last zero-write, debounce=%.0fs)",
                         self.id, now - self._last_zero_write_ts, self.ZERO_ZERO_DEBOUNCE_S)
-                    return
-            
-            
-            
+                    return False
             self.client.write_registers(1000, formatted_current, unit=self.id)
             evse_relay_log.info("EVSE id=%d: set_current %.2fA (reg=%d, prev_reg=%d)%s",
                                self.id, current, formatted_current, self.evse_current,
                                " [forced]" if force else "")
             self.evse_current = formatted_current
-            if formatted_current != 0:
-                self._last_nonzero_write_ts = now
-            else:
-                self._last_zero_write_ts = now
+            # Only arm the min-off/debounce timers for non-forced (algorithm-driven) writes.
+            # Forced writes are administrative safety actions (phase switch, CP interruption,
+            # heartbeat-loss stop) — they are unrelated to the PV-surplus bounce this debounce
+            # guards against. If they armed `_last_zero_write_ts`, the very next legitimate
+            # restart attempt right after a phase switch/CP interruption would be wrongly
+            # suppressed for up to NONZERO_WRITE_DEBOUNCE_S (120s), leaving the car offered 0A
+            # for far longer than intended.
+            if not force:
+                if formatted_current != 0:
+                    self._last_nonzero_write_ts = now
+                else:
+                    self._last_zero_write_ts = now
             is_zero = formatted_current == 0
             if self._last_was_zero is not None and is_zero != self._last_was_zero:
                 self._toggle_timestamps = [t for t in self._toggle_timestamps if now - t < 120]
@@ -170,3 +195,5 @@ class Evse:
                         "EVSE id=%d: %d zero/non-zero toggles in 120s — possible relay loop!",
                         self.id, len(self._toggle_timestamps))
             self._last_was_zero = is_zero
+            return True
+        return False
