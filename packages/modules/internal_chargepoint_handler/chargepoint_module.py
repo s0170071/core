@@ -108,14 +108,9 @@ class ChargepointModule(AbstractChargepoint):
                           self.local_charge_point_num, gpio_cp)
 
     def set_current(self, current: float, force: bool = False) -> None:
-        applied = False
         with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            applied = self._client.evse_client.set_current(
-                current, phases_in_use=self.old_phases_in_use, force=force)
-        # Only log if the write was actually applied — if the EVSE-level debounce suppressed
-        # it, the EVSE current did not change, so logging `current` here would be misleading
-        # (it would look like a change happened when the write was in fact skipped).
-        if applied and current != self._last_current_logged:
+            self._client.evse_client.set_current(current, phases_in_use=self.old_phases_in_use, force=force)
+        if current != self._last_current_logged:
             evse_relay_log.info("CP%d: evse_current=%.1fA phases=%d%s",
                                 self.local_charge_point_num, current, self.old_phases_in_use,
                                 " [forced]" if force else "")

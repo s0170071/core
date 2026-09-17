@@ -4,7 +4,7 @@ Instanzen gelöscht werden können, der Zugriff aber nicht verändert werden mus
 """
 import copy
 import logging
-from threading import Event, Lock
+from threading import Event, Lock, RLock
 from functools import wraps
 from typing import Dict
 from control.bat import Bat
@@ -30,6 +30,10 @@ from modules.common.abstract_device import AbstractDevice
 from modules.common.abstract_io import AbstractIoDevice
 
 log = logging.getLogger(__name__)
+# Die Kopier-Routinen ersetzen die Objekte in data.data komplett. Algorithmus-interne Felder wie
+# Counter.data.set.raw_currents_left werden dabei auf ihre Defaults zurueckgesetzt, weil sie nicht
+# per MQTT empfangen werden. Der Algorithmus haelt diesen Lock ueber prep/calc/proc.
+snapshot_lock = RLock()
 bat_data_lock = Lock()
 bat_all_data_lock = Lock()
 graph_data_lock = Lock()
@@ -394,7 +398,8 @@ class Data:
 
     def copy_module_data(self) -> None:
         with ModuleDataReceivedContext(self.event_module_update_completed):
-            self.__copy_module_data()
+            with snapshot_lock:
+                self.__copy_module_data()
 
     def __copy_module_data(self) -> None:
         """ kopiert die Daten, die per MQTT empfangen wurden.
@@ -435,16 +440,17 @@ class Data:
         """
         with ModuleDataReceivedContext(self.event_module_update_completed):
             try:
-                self.general_data = copy.deepcopy(SubData.general_data)
-                self.io_actions = copy.deepcopy(SubData.io_actions)
-                self.io_states = copy.deepcopy(SubData.io_states)
-                self.optional_data = copy.deepcopy(SubData.optional_data)
-                self.__copy_ev_data()
-                self.__copy_cp_data()
-                self.__copy_counter_data()
-                self.__copy_system_data()
-                self.__copy_module_data()
-                self.graph_data = copy.deepcopy(SubData.graph_data)
+                with snapshot_lock:
+                    self.general_data = copy.deepcopy(SubData.general_data)
+                    self.io_actions = copy.deepcopy(SubData.io_actions)
+                    self.io_states = copy.deepcopy(SubData.io_states)
+                    self.optional_data = copy.deepcopy(SubData.optional_data)
+                    self.__copy_ev_data()
+                    self.__copy_cp_data()
+                    self.__copy_counter_data()
+                    self.__copy_system_data()
+                    self.__copy_module_data()
+                    self.graph_data = copy.deepcopy(SubData.graph_data)
             except Exception:
                 log.exception("Fehler im Prepare-Modul")
 

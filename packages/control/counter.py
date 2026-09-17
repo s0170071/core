@@ -476,6 +476,7 @@ class Counter:
         charging_ev_data = chargepoint.data.set.charging_ev_data
         control_parameter = chargepoint.data.control_parameter
         timestamp_switch_on_off = control_parameter.timestamp_switch_on_off
+        pv_config = data.data.general_data.data.chargemode_config.pv_charging
 
         power_in_use, threshold = self.calc_switch_off(chargepoint)
         if control_parameter.state == ChargepointState.SWITCH_OFF_DELAY:
