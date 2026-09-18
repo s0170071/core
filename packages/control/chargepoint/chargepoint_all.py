@@ -48,11 +48,13 @@ class AllChargepoints:
                     if (not chargepoint.data.get.plug_state or
                             # Kein EV, das Laden soll
                             # Kein EV, das auf das Ablaufen der Einschalt- oder Phasenumschaltverzögerung wartet
+                            # NO_CHARGING_ALLOWED is intentionally excluded: a CP in that state holds
+                            # no active reserved/released surplus, so it should not block the
+                            # reset of leaked reservations from prior aborted phase switches.
                             (control_parameter.state != ChargepointState.PERFORMING_PHASE_SWITCH and
                                 control_parameter.state != ChargepointState.PHASE_SWITCH_DELAY and
                                 control_parameter.state != ChargepointState.SWITCH_OFF_DELAY and
-                                control_parameter.state != ChargepointState.SWITCH_ON_DELAY and
-                                control_parameter.state != ChargepointState.NO_CHARGING_ALLOWED)):
+                                control_parameter.state != ChargepointState.SWITCH_ON_DELAY)):
                         continue
                     else:
                         break

@@ -86,7 +86,8 @@ class SubData:
                  event_soc: Event,
                  event_jobs_running: Event,
                  event_modbus_server: Event,
-                 event_restart_gpio: Event,):
+                 event_restart_gpio: Event,
+                 event_update_internal_chargepoint: Event = None,):
         self.event_ev_template = event_ev_template
         self.event_cp_config = event_cp_config
         self.event_module_update_completed = event_module_update_completed
@@ -103,6 +104,7 @@ class SubData:
         self.event_jobs_running = event_jobs_running
         self.event_modbus_server = event_modbus_server
         self.event_restart_gpio = event_restart_gpio
+        self.event_update_internal_chargepoint = event_update_internal_chargepoint
         self.heartbeat = False
         # Immer wenn ein Subscribe hinzugefügt wird, wird der Zähler hinzugefügt und subdata_initialized gepublished.
         # Wenn subdata_initialized empfangen wird, wird der Zäheler runtergezählt. Erst wenn alle subdata_initialized
@@ -1011,6 +1013,8 @@ class SubData:
                 index = get_index(msg.topic)
                 if re.search("/internal_chargepoint/[0-1]/data/", msg.topic) is not None:
                     self.set_json_payload_class(var[f"cp{index}"].data, msg)
+                    if "set_current" in msg.topic and self.event_update_internal_chargepoint:
+                        self.event_update_internal_chargepoint.set()
                 elif re.search("/internal_chargepoint/[0-1]/get/", msg.topic) is not None:
                     self.set_json_payload_class(var[f"cp{index}"].get, msg)
             elif "internal_chargepoint/global_data" in msg.topic:

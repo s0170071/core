@@ -142,6 +142,17 @@ class Process:
                      f"state {ChargepointState(chargepoint.data.control_parameter.state).name}")
 
     def _start_charging(self, chargepoint: chargepoint.Chargepoint) -> Thread:
+        current = chargepoint.data.set.current
+        # Vehicle current offset: compensates for vehicles that draw less/more than commanded.
+        # Applied at the hardware boundary so the regulator and UI see the unmodified setpoint.
+        if current != 0:
+            offset = chargepoint.data.set.charging_ev_data.data.current_offset
+            if offset != 0:
+                current = max(current, chargepoint.data.control_parameter.min_current)
+                current = chargepoint.check_cp_max_current(current, chargepoint.data.control_parameter.phases)
+                current = current + offset
+                current = round(current, 2)
+                log.info(f"LP{chargepoint.num}: EVSE current {current} A (offset {offset:+.1f} A)")
         return Thread(target=chargepoint.chargepoint_module.set_current,
-                      args=(chargepoint.data.set.current,),
+                      args=(current,),
                       name=f"set current cp{chargepoint.chargepoint_module.config.id}")

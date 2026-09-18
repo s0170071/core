@@ -34,6 +34,18 @@ def _perform_phase_switch(chargepoint_module: AbstractChargepoint, phases: int) 
         chargepoint_module.switch_phases(phases)
     except Exception:
         log.exception("Fehler im Phasenumschaltungs-Modul")
+    finally:
+        # When the GPIO sequence (CP signal off → 3-phase relay flip → CP
+        # signal on) is done — typically ~1 s — schedule an immediate
+        # algorithm tick. Otherwise the post-switch state (and the new
+        # EVSE current) only gets applied on the next periodic 10 s tick,
+        # adding up to 10 s of unnecessary wait. The InstantTrigger
+        # singleton may be unset very early at boot — that's fine.
+        try:
+            from helpermodules.instant_trigger import request_algorithm_tick
+            request_algorithm_tick(delay_s=2.0, reason="phase_switch_done")
+        except Exception:
+            log.exception("phase_switch: konnte Algorithmus-Tick nicht anfordern")
 
 
 def phase_switch_thread_alive(cp_num):

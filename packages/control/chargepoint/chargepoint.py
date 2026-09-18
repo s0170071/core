@@ -302,8 +302,9 @@ class Chargepoint(ChargepointRfidMixin):
             # Unterstützt der Ladepunkt die CP-Unterbrechung und benötigt das Auto eine CP-Unterbrechung?
             if charging_ev.ev_template.data.control_pilot_interruption:
                 if self.data.config.control_pilot_interruption_hw:
-                    # Wird die Ladung gestartet?
-                    if self.data.set.current_prev == 0 and self.data.set.current != 0:
+                    # Wird die Ladung gestartet? (nicht nach Phasenumschaltung, da diese bereits CP umschaltet)
+                    if (self.data.set.current_prev == 0 and self.data.set.current != 0 and
+                            self.data.control_parameter.state != ChargepointState.WAIT_FOR_USING_PHASES):
                         # Die CP-Unterbrechung erfolgt in Threads, da diese länger als ein Zyklus dauert.
                         if thread_handler(Thread(
                                 target=self.chargepoint_module.interrupt_cp,
@@ -496,7 +497,20 @@ class Chargepoint(ChargepointRfidMixin):
                 if ((not charging_ev.ev_template.data.prevent_phase_switch or
                         self.data.set.log.imported_since_plugged == 0) and
                         self.data.config.auto_phase_switch_hw):
-                    phases = 1
+                    # Default to 1-phase for fresh PV starts, EXCEPT when the
+                    # PV switch-on logic (counter.switch_on_threshold_reached /
+                    # switch_on_timer_expired) has already committed to
+                    # max_phases because surplus is sufficient.
+                    # Must cover ALL charging-authorized states, not just
+                    # WAIT_FOR_USING_PHASES, because check_phase_switch_completed()
+                    # can transition to CHARGING_ALLOWED on the same tick — if we
+                    # only guard WAIT_FOR_USING_PHASES the next tick falls through
+                    # to phases=1 and triggers an immediate 3->1 relay switch.
+                    if (self.data.control_parameter.state in CHARGING_STATES
+                            and self.data.control_parameter.phases > 1):
+                        phases = self.data.control_parameter.phases
+                    else:
+                        phases = 1
                 else:
                     if self.data.set.phases_to_use != 0:
                         phases = self.data.set.phases_to_use

@@ -80,6 +80,7 @@ class EvData:
     tag_id: List[str] = field(default_factory=empty_list_factory, metadata={
         "topic": "tag_id"})
     get: Get = field(default_factory=get_factory)
+    current_offset: float = field(default=0, metadata={"topic": "current_offset"})
 
 
 class Ev:
@@ -259,8 +260,13 @@ class Ev:
                                        get_power: float,
                                        max_current_cp: int,
                                        limit: LoadmanagementLimit) -> Tuple[bool, Optional[str]]:
-        # Manche EV laden mit 6.1A bei 6A Soll-Strom
-        min_current = max(control_parameter.min_current, control_parameter.required_current)
+        # For the 3→1 condition, use the template minimum current (not the algorithm's
+        # required_current). Using required_current causes premature 3→1 switches during PV
+        # charging: the surplus algorithm tracks available power (e.g. 9A), and with
+        # nominal_difference the threshold becomes 11A — so any transient surplus dip triggers
+        # the switch even though the car is well above minimum (6A). The algorithm should first
+        # reduce current toward min_current before considering a phase switch.
+        min_current = control_parameter.min_current
         min_current_range = min_current + self.ev_template.data.nominal_difference
         max_current = min(self.ev_template.data.max_current_single_phase, max_current_cp)
         max_current_range = max_current - self.ev_template.data.nominal_difference
@@ -279,6 +285,24 @@ class Ev:
                             phases_in_use == 1)
         condition_3_to_1 = get_medium_charging_current(
             get_currents) < min_current_range and all_surplus <= 0 and phases_in_use > 1
+        # Suppress 3→1 while the house battery still has reserve in MIN_SOC_BAT mode.
+        # The bat_all ASSIST state will provide discharge power to sustain min_current on
+        # the current phase count; we only want to phase-switch once the battery is
+        # actually depleted (PROTECT state engaged).
+        if condition_3_to_1:
+            try:
+                bat_all = data.data.bat_all_data
+                pv_cfg = data.data.general_data.data.chargemode_config.pv_charging
+                if (bat_all.data.config.configured
+                        and pv_cfg.bat_mode == "min_soc_bat_mode"
+                        and not bat_all.data.set.protect_active
+                        and bat_all.data.get.soc > pv_cfg.min_bat_soc):
+                    log.debug(
+                        f"3→1 Phasenumschaltung unterdrückt: Speicher-SoC {bat_all.data.get.soc}% > "
+                        f"min_bat_soc {pv_cfg.min_bat_soc}% (ASSIST stützt min_current).")
+                    condition_3_to_1 = False
+            except Exception:
+                log.exception("Fehler bei Speicher-Gating der Phasenumschaltung")
         if condition_1_to_3 or condition_3_to_1:
             return True, None
         else:

@@ -37,4 +37,3 @@ class Prepare:
             data.data.io_actions.setup()
         except Exception:
             log.exception("Fehler im Prepare-Modul")
-        data.data.print_all()

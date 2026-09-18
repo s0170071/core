@@ -20,6 +20,7 @@ import dataclass_utils
 
 log = logging.getLogger(__name__)
 mqtt_log = logging.getLogger("mqtt")
+evse_relay_log = logging.getLogger("evse_relay")
 
 TIMESTAMP_2100 = 4102441200  # 01.01.2100 00:00:00
 
@@ -35,6 +36,29 @@ class SetData:
         self.event_soc = event_soc
         self.event_subdata_initialized = event_subdata_initialized
         self.heartbeat = False
+        # Per-CP memory of the last observed chargemode, used to suppress
+        # duplicate `set/charge_template` publishes (algorithm re-publishes,
+        # GUI/API echoes, etc.) so the relay log only fires on actual
+        # user-initiated chargemode transitions.
+        self._last_chargemode = {}  # type: dict
+
+    def _apply_chargemode_to_live_tree(self, cp_num, mode: str) -> None:
+        """Push the new chargemode into the live data tree for the given CP
+        immediately, without waiting for subdata to deserialise the full
+        charge_template payload. This closes the race where InstantTrigger
+        wakes the main loop before subdata has applied the change, causing
+        the algorithm to run on the stale (previous) chargemode for one tick.
+        """
+        try:
+            cp = data.data.cp_data.get(f"cp{cp_num}")
+            if cp is None:
+                return
+            ct = cp.data.set.charge_template
+            if ct is not None:
+                ct.data.chargemode.selected = mode
+        except Exception:
+            log.exception(
+                f"chargemode-shortcut: failed to apply {mode} to live tree for cp{cp_num}")
 
     def set_data(self):
         self.internal_broker_client = BrokerClient("mqttset", self.on_connect, self.on_message)
@@ -395,6 +419,8 @@ class SetData:
                 self._validate_value(msg, float, [(0, 1000)])
             elif "/get/force_soc_update" in msg.topic:
                 self._validate_value(msg, bool)
+            elif "/current_offset" in msg.topic:
+                self._validate_value(msg, float)
             else:
                 self.__unknown_topic(msg)
         except Exception:
@@ -411,8 +437,36 @@ class SetData:
             if (re.search("/vehicle/template/charge_template/[0-9]+$", msg.topic) is not None or
                     re.search("/chargepoint/[0-9]+/set/charge_template$", msg.topic) is not None):
                 self._validate_value(msg, "json")
+                _is_cp_charge_template = re.search(
+                    "/chargepoint/[0-9]+/set/charge_template$", msg.topic) is not None
+                if _is_cp_charge_template:
+                    try:
+                        _payload = decode_payload(msg.payload)
+                        if isinstance(_payload, dict):
+                            _chargemode = _payload.get("chargemode", {})
+                            _mode = (_chargemode.get("selected", "")
+                                     if isinstance(_chargemode, dict) else "")
+                        else:
+                            _mode = ""
+                        _cp_idx = get_index(msg.topic)
+                        # Suppress duplicates: the algorithm tick republishes
+                        # the whole charge_template on every run, and various
+                        # GUI/API paths echo the same value too. Only react
+                        # when the chargemode actually changed.
+                        if self._last_chargemode.get(_cp_idx) != _mode:
+                            self._last_chargemode[_cp_idx] = _mode
+                            evse_relay_log.info(
+                                f"CP{_cp_idx}: charge_template button \u2192 chargemode={_mode}")
+                            # Push the new chargemode into the live data tree
+                            # immediately so an algorithm tick fired by
+                            # InstantTrigger doesn't race ahead of subdata and
+                            # operate on the previous mode.
+                            if _mode:
+                                self._apply_chargemode_to_live_tree(_cp_idx, _mode)
+                    except Exception:
+                        evse_relay_log.info(f"charge_template button: {msg.topic}")
                 if data.data.general_data.data.temporary_charge_templates_active is False:
-                    if re.search("/chargepoint/[0-9]+/set/charge_template$", msg.topic) is not None:
+                    if _is_cp_charge_template:
                         payload = decode_payload(msg.payload)
                         Pub().pub(f"openWB/vehicle/template/charge_template/{payload['id']}", payload)
                         cp_num = get_index(msg.topic)
