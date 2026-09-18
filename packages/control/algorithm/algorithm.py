@@ -8,6 +8,7 @@ from control.algorithm.bidi_charging import Bidi
 from control.algorithm.min_current import MinCurrent
 from control.algorithm.no_current import NoCurrent
 from control.algorithm.surplus_controlled import SurplusControlled
+from custom import bat_buffer
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class Algorithm:
             self.bidi.set_bidi()
             self.no_current.set_no_current()
             self.no_current.set_none_current()
+            bat_buffer.apply_min_current_floor()
         except Exception:
             log.exception("Fehler im Algorithmus-Modul")
 

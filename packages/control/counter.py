@@ -13,6 +13,7 @@ from control.algorithm.utils import get_medium_charging_current
 from control.chargemode import Chargemode
 from control.chargepoint.chargepoint import Chargepoint
 from control.chargepoint.chargepoint_state import ChargepointState
+from custom import bat_buffer
 from dataclass_utils.factories import currents_list_factory, voltages_list_factory
 from helpermodules import timecheck
 from helpermodules.constants import NO_ERROR
@@ -278,6 +279,8 @@ class Counter:
 
     def switch_on_threshold_reached(self, chargepoint: Chargepoint) -> None:
         try:
+            if bat_buffer.block_switch_on(self, chargepoint):
+                return
             message = None
             control_parameter = chargepoint.data.control_parameter
             feed_in_limit = chargepoint.data.set.charge_template.data.chargemode.pv_charging.\
@@ -327,6 +330,8 @@ class Counter:
         Schaltpunkte ergeben sich ggf noch aus der Einspeisegrenze.
         """
         try:
+            if bat_buffer.block_switch_on(self, chargepoint):
+                return
             msg = None
             pv_config = data.data.general_data.data.chargemode_config.pv_charging
             control_parameter = chargepoint.data.control_parameter
@@ -413,6 +418,9 @@ class Counter:
         Ist die Abschaltverzögerung bereits aktiv, wird geprüft, ob die Abschaltschwelle wieder
         unterschritten wurde, sodass die Verzögerung wieder gestoppt wird.
         """
+        decision = bat_buffer.switch_off_decision(chargepoint)
+        if decision is not None:
+            return decision
         charge = True
         msg = None
         charging_ev_data = chargepoint.data.set.charging_ev_data

@@ -25,6 +25,7 @@ from control.chargepoint.chargepoint_state import ChargepointState, PHASE_SWITCH
 from control.chargepoint.charging_type import ChargingType
 from control.chargepoint.control_parameter import ControlParameter
 from control.ev.ev_template import EvTemplate
+from custom import bat_buffer
 
 log = logging.getLogger(__name__)
 
@@ -275,8 +276,8 @@ class Ev:
         condition_1_to_3 = ((((get_medium_charging_current(get_currents) > max_current_range or current_limit_reached)
                             and surplus > required_surplus) or unbalanced_load_limit_reached) and
                             phases_in_use == 1)
-        condition_3_to_1 = get_medium_charging_current(
-            get_currents) < min_current_range and surplus <= 0 and phases_in_use > 1
+        condition_3_to_1 = (get_medium_charging_current(get_currents) < min_current_range and surplus <= 0 and
+                            phases_in_use > 1 and not bat_buffer.suppress_3_to_1(control_parameter))
         if condition_1_to_3 or condition_3_to_1:
             return True, None
         else:
