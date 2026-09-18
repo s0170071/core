@@ -6,6 +6,7 @@ from helpermodules.broker import BrokerClient
 from helpermodules.utils import run_command
 from helpermodules.utils.error_handling import CP_ERROR, ErrorTimerContext
 from helpermodules.utils.topic_parser import decode_payload
+from custom import evse_transition_filter
 from modules.common.abstract_chargepoint import AbstractChargepoint
 from modules.common.component_context import SingleComponentUpdateContext
 from modules.common.component_state import ChargepointState
@@ -143,9 +144,15 @@ class ChargepointModule(AbstractChargepoint):
 
     def perform_phase_switch(self, phases_to_use: int) -> None:
         gpio_cp, gpio_relay = self._client.get_pins_phase_switch(phases_to_use)
+        # Der Übergangsfilter hat Vorrang. Erst warten, bis die Abschaltung erlaubt ist, dann
+        # umschalten -- unter Last darf das Relais nicht schalten. Läuft ohnehin in einem eigenen
+        # Thread (internal_chargepoint_handler.__thread_phase_switch).
+        if not evse_transition_filter.wait_for_window(self._client.evse_client.id, 0):
+            log.error(f"Phasenumschaltung an LP{self.local_charge_point_num} abgebrochen: die EVSE darf noch "
+                      "nicht abgeschaltet werden. Die Umschaltung wird spaeter erneut angefordert.")
+            return
         with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            # Phasenumschaltung: der Filter darf die Abschaltung nicht verzögern.
-            self._client.evse_client.set_current(0, force=True)
+            self._client.evse_client.set_current(0, wait=True)
         time.sleep(5)
         GPIO.output(gpio_cp, GPIO.HIGH)  # CP off
         GPIO.output(gpio_relay, GPIO.HIGH)  # 3 on/off
@@ -157,9 +164,14 @@ class ChargepointModule(AbstractChargepoint):
 
     def perform_cp_interruption(self, duration: int) -> None:
         gpio_cp = self._client.get_pins_cp_interruption()
+        # Wie bei der Phasenumschaltung: der Filter hat Vorrang, der CP wird erst unterbrochen,
+        # wenn die EVSE abgeschaltet werden darf.
+        if not evse_transition_filter.wait_for_window(self._client.evse_client.id, 0):
+            log.error(f"CP-Unterbrechung an LP{self.local_charge_point_num} abgebrochen: die EVSE darf noch "
+                      "nicht abgeschaltet werden.")
+            return
         with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            # CP-Unterbrechung: der Filter darf die Abschaltung nicht verzögern.
-            self._client.evse_client.set_current(0, force=True)
+            self._client.evse_client.set_current(0, wait=True)
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BOARD)
         GPIO.setup(gpio_cp, GPIO.OUT)

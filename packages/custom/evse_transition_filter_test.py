@@ -20,14 +20,14 @@ def clock(monkeypatch) -> List[float]:
     return now
 
 
-def write(evse_id: int, current: int, force: bool = False) -> bool:
+def write(evse_id: int, current: int) -> bool:
     """Bildet die Aufrufsequenz in evse.set_current nach.
 
     :return: True, wenn der Schreibzugriff tatsächlich rausgegangen wäre.
     """
-    if not filt.allow_write(evse_id, current, force):
+    if not filt.allow_write(evse_id, current):
         return False
-    filt.record_write(evse_id, current, force)
+    filt.record_write(evse_id, current)
     return True
 
 
@@ -130,32 +130,56 @@ def test_unterdrueckter_schreibzugriff_bewaffnet_die_timer_nicht(clock):
     assert write(1, 0) is True
 
 
-# Eigenschaft 3: force umgeht den Filter und bewaffnet die Timer nicht
+# Eigenschaft 3: es gibt keine Umgehung, nur Warten
 
 
-def test_force_umgeht_die_mindest_ein_zeit(clock):
+def test_es_gibt_keinen_bypass(clock):
+    """Der Filter kennt kein force. Die Signatur darf nie wieder eines bekommen."""
+    import inspect
+    for func in (filt.allow_write, filt.record_write, filt.remaining):
+        assert "force" not in inspect.signature(func).parameters
+
+
+def test_wait_kehrt_sofort_zurueck_wenn_das_fenster_offen_ist(clock, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(filt.time, "sleep", lambda s: sleeps.append(s))
     assert write(1, 6) is True
-    clock[0] += 1
-    assert write(1, 0, force=True) is True
+    clock[0] += filt.MIN_ON_TIME_S
+    assert filt.wait_for_window(1, 0) is True
+    assert sleeps == []
 
 
-def test_force_bewaffnet_die_mindest_aus_zeit_nicht(clock):
-    """Sonst bliebe die Ladung nach einer Phasenumschaltung 5 Minuten aus."""
+def test_wait_wartet_das_fenster_ab(clock, monkeypatch):
+    # Die Uhr läuft mit jedem sleep weiter, wie in echt.
+    def fake_sleep(seconds):
+        clock[0] += seconds
+    monkeypatch.setattr(filt.time, "sleep", fake_sleep)
     assert write(1, 6) is True
-    clock[0] += 1
-    assert write(1, 0, force=True) is True
-    clock[0] += 6
-    assert write(1, 6) is True
-
-
-def test_force_bewaffnet_die_mindest_ein_zeit_nicht(clock):
+    clock[0] += 10
+    start = clock[0]
+    assert filt.wait_for_window(1, 0) is True
+    # Gewartet wurde exakt bis zum Ablauf der Mindest-Ein-Zeit, nicht länger.
+    assert clock[0] - start == pytest.approx(filt.MIN_ON_TIME_S - 10, abs=filt.WAIT_POLL_S)
+    # Und danach darf auch wirklich geschrieben werden.
     assert write(1, 0) is True
-    clock[0] += filt.MIN_OFF_TIME_S
-    assert write(1, 6, force=True) is True
-    clock[0] += 1
-    # Der erzwungene Einschaltvorgang hat den Zustand nicht auf "ein" gesetzt,
-    # der Filter sieht weiterhin die letzte reguläre 0.
-    assert write(1, 0) is True
+
+
+def test_wait_bricht_nach_timeout_ab(clock, monkeypatch):
+    """Wenn das Fenster nicht aufgeht, wird nicht geschaltet."""
+    def fake_sleep(seconds):
+        clock[0] += seconds
+    monkeypatch.setattr(filt.time, "sleep", fake_sleep)
+    # remaining() gibt nie 0 zurück -> das Fenster geht nie auf.
+    monkeypatch.setattr(filt, "remaining", lambda *a: 999.0)
+    monkeypatch.setattr(filt, "log", Mock())
+    assert filt.wait_for_window(1, 0, timeout=10) is False
+
+
+def test_wait_ist_fail_safe_nicht_fail_open(clock, monkeypatch):
+    """Anders als allow_write: an wait_for_window haengt ein Schaltvorgang."""
+    monkeypatch.setattr(filt, "remaining", Mock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(filt, "log", Mock())
+    assert filt.wait_for_window(1, 0) is False
 
 
 # Trennung nach evse_id
@@ -203,7 +227,7 @@ def test_keine_relay_loop_warnung_ausserhalb_des_fensters(clock, monkeypatch):
 def test_fehler_im_filter_laesst_den_schreibzugriff_durch(monkeypatch, clock):
     assert write(1, 6) is True
     clock[0] += 1
-    monkeypatch.setattr(filt, "_state", Mock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(filt, "remaining", Mock(side_effect=RuntimeError("boom")))
     monkeypatch.setattr(filt, "log", Mock())
     assert filt.allow_write(1, 0) is True
 

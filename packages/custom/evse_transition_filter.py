@@ -5,6 +5,11 @@ selbst befreien, wenn die Ladefreigabe zu schnell hintereinander entzogen und
 wieder erteilt wird. Dieser Filter erzwingt daher eine Mindest-Ein- und eine
 Mindest-Aus-Zeit auf Register 1000.
 
+**Der Filter hat Vorrang vor allem anderen.** Es gibt keine Umgehung. Ein
+Schreibzugriff, der die Mindestzeiten verletzen würde, findet nicht statt --
+auch nicht für Phasenumschaltung, CP-Unterbrechung oder Fehlerabschaltung. Wer
+zwingend schreiben muss, wartet über :func:`wait_for_window`, bis er darf.
+
 Drei Eigenschaften, die gelten müssen:
 
 1. **Nur der Wechsel 0 <-> ungleich 0 wird begrenzt.** Eine Änderung von 6A auf
@@ -17,10 +22,15 @@ Drei Eigenschaften, die gelten müssen:
    geschluckt: der 0-Schreibzugriff wird unterdrückt, der darauf folgende
    ungleich-0-Schreibzugriff ist wegen des unveränderten ``evse_current`` ein
    No-Op.
-3. **``force=True`` umgeht den Filter und bewaffnet die Timer nicht.**
-   Erzwungene Schreibzugriffe sind administrative Aktionen (Phasenumschaltung,
-   CP-Unterbrechung), keine Regelungsentscheidungen. Würden sie die Timer
-   setzen, bliebe die Ladung nach einer Phasenumschaltung 5 Minuten aus.
+3. **Wer nicht einfach den nächsten Zyklus abwarten kann, wartet aktiv.**
+   Phasenumschaltung und CP-Unterbrechung schalten Hardware in dem Moment, in
+   dem sie den Strom auf 0 setzen. Würde dieser Schreibzugriff nur unterdrückt
+   und die Prozedur liefe weiter, schaltete das Relais unter Last. Diese
+   Prozeduren laufen ohnehin in eigenen Threads (siehe
+   ``control/phase_switch.py``) und blockieren daher über
+   :func:`wait_for_window`, bis die Abschaltung erlaubt ist. Kommt die Freigabe
+   nicht rechtzeitig, unterbleibt die Umschaltung -- sie wird später erneut
+   angefordert.
 
 Der Zustand liegt bewusst auf Modul-Ebene und wird über ``evse_id`` getrennt
 gehalten.
@@ -39,6 +49,12 @@ from helpermodules.logger import FORMAT_STR_SHORT, PERSISTENT_LOG_PATH
 # Abschnitt 4.4 des Portierungsplans. Nicht "passend" kürzen.
 MIN_ON_TIME_S = 300.0    # wie lange ein ungleich-0-Wert stehen muss, bevor 0 geschrieben werden darf
 MIN_OFF_TIME_S = 300.0   # wie lange eine 0 stehen muss, bevor wieder ungleich 0 geschrieben werden darf
+
+# Obergrenze für wait_for_window. Ein berechtigtes Warten dauert nie länger als
+# das größere der beiden Fenster; der Rest ist Sicherheitsmarge für den Fall,
+# dass ein anderer Thread das Fenster zwischendurch neu aufzieht.
+MAX_WAIT_S = max(MIN_ON_TIME_S, MIN_OFF_TIME_S) + 30.0
+WAIT_POLL_S = 1.0
 
 # Reine Diagnose, ohne Einfluss auf das Verhalten.
 TOGGLE_WINDOW_S = 120.0
@@ -76,7 +92,8 @@ class _EvseState:
 
 
 _states: Dict[int, _EvseState] = {}
-# Der interne Ladepunkt läuft in einem eigenen Thread, daher ein Lock.
+# Der interne Ladepunkt, die Phasenumschaltung und die CP-Unterbrechung laufen
+# jeweils in eigenen Threads, daher ein Lock.
 _lock = Lock()
 
 
@@ -88,49 +105,78 @@ def _state(evse_id: int) -> _EvseState:
     return state
 
 
-def allow_write(evse_id: int, formatted_current: int, force: bool = False) -> bool:
+def remaining(evse_id: int, formatted_current: int) -> float:
+    """Wie lange ist dieser Schreibzugriff noch gesperrt?
+
+    :return: Restzeit in Sekunden, 0.0 wenn sofort geschrieben werden darf.
+             Protokolliert bewusst nichts, damit Warteschleifen das Log nicht
+             fluten.
+    """
+    with _lock:
+        state = _state(evse_id)
+        is_zero = formatted_current == 0
+        if state.last_was_zero is None or is_zero == state.last_was_zero:
+            # Erster Schreibzugriff, oder reine Änderung der Stromstärke.
+            return 0.0
+        now = time.monotonic()
+        if is_zero:
+            return max(0.0, MIN_ON_TIME_S - (now - state.last_nonzero_ts))
+        return max(0.0, MIN_OFF_TIME_S - (now - state.last_zero_ts))
+
+
+def allow_write(evse_id: int, formatted_current: int) -> bool:
     """Darf dieser Schreibzugriff auf Register 1000 jetzt raus?
 
     :return: True -> schreiben. False -> diesen Zyklus überspringen, die
              Regelung stellt den Wunsch im nächsten Zyklus erneut.
     """
-    if force:
-        return True
     try:
-        with _lock:
-            state = _state(evse_id)
-            is_zero = formatted_current == 0
-            if state.last_was_zero is None or is_zero == state.last_was_zero:
-                # Erster Schreibzugriff, oder reine Änderung der Stromstärke.
-                return True
-            now = time.monotonic()
-            if is_zero:
-                elapsed = now - state.last_nonzero_ts
-                if elapsed < MIN_ON_TIME_S:
-                    log.warning(f"EVSE id={evse_id}: zero-write suppressed "
-                                f"({elapsed:.1f}s since last non-zero, min-on={MIN_ON_TIME_S:.0f}s)")
-                    return False
-            else:
-                elapsed = now - state.last_zero_ts
-                if elapsed < MIN_OFF_TIME_S:
-                    log.warning(f"EVSE id={evse_id}: non-zero-write suppressed "
-                                f"({elapsed:.1f}s since last zero-write, min-off={MIN_OFF_TIME_S:.0f}s)")
-                    return False
-            return True
+        left = remaining(evse_id, formatted_current)
+        if left > 0:
+            kind = "zero" if formatted_current == 0 else "non-zero"
+            log.warning(f"EVSE id={evse_id}: {kind}-write suppressed, {left:.1f}s left in window")
+            return False
+        return True
     except Exception:
         # Im Zweifel schreiben lassen: Upstream-Verhalten ist das sichere Fallback.
         log.exception("Fehler im EVSE-Übergangsfilter")
         return True
 
 
-def record_write(evse_id: int, formatted_current: int, force: bool = False) -> None:
-    """Meldet einen tatsächlich erfolgten Schreibzugriff zurück.
+def wait_for_window(evse_id: int, formatted_current: int, timeout: float = MAX_WAIT_S) -> bool:
+    """Blockiert, bis der Schreibzugriff erlaubt ist.
 
-    Erzwungene Schreibzugriffe werden bewusst nicht vermerkt, sonst würde die
-    Ladung nach einer Phasenumschaltung für MIN_OFF_TIME_S blockiert.
+    Nur für Aufrufer, die den Schreibzugriff nicht einfach im nächsten Zyklus
+    wiederholen können, weil sie unmittelbar danach Hardware schalten.
+
+    :return: True -> es darf geschrieben werden. False -> das Fenster ging
+             innerhalb von ``timeout`` nicht auf; der Aufrufer muss seine
+             Prozedur abbrechen und darf **nicht** trotzdem schalten.
     """
-    if force:
-        return
+    try:
+        left = remaining(evse_id, formatted_current)
+        if left <= 0:
+            return True
+        log.warning(f"EVSE id={evse_id}: warte {left:.1f}s auf das Freigabefenster, bevor geschaltet wird")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(min(WAIT_POLL_S, left))
+            left = remaining(evse_id, formatted_current)
+            if left <= 0:
+                log.warning(f"EVSE id={evse_id}: Freigabefenster offen, Schaltvorgang wird fortgesetzt")
+                return True
+        log.error(f"EVSE id={evse_id}: Freigabefenster ging nicht innerhalb von {timeout:.0f}s auf, "
+                  "Schaltvorgang wird abgebrochen")
+        return False
+    except Exception:
+        log.exception("Fehler im EVSE-Übergangsfilter")
+        # Fail-safe statt fail-open: hier hängt ein Schaltvorgang dran, der
+        # unter Last nicht stattfinden darf.
+        return False
+
+
+def record_write(evse_id: int, formatted_current: int) -> None:
+    """Meldet einen tatsächlich erfolgten Schreibzugriff zurück."""
     try:
         with _lock:
             state = _state(evse_id)

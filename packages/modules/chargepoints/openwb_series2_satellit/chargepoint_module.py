@@ -5,6 +5,7 @@ import time
 from typing import Optional
 
 from control import data
+from custom import evse_transition_filter
 from helpermodules.utils.error_handling import CP_ERROR, ErrorTimerContext
 from helpermodules.utils.run_command import run_command
 from modules.chargepoints.openwb_series2_satellit.config import OpenWBseries2Satellit
@@ -123,10 +124,7 @@ class ChargepointModule(AbstractChargepoint):
 
     def set_current(self, current: float) -> None:
         if self.version is not None:
-            # Abschaltungen wegen Kommunikationsfehlern und die Notabschaltung ohne Versions-Info sind
-            # Sicherheitsfunktionen und umgehen daher den EVSE-Übergangsfilter.
-            force = self.client_error_context.error_counter_exceeded()
-            if force:
+            if self.client_error_context.error_counter_exceeded():
                 current = 0
             with SingleComponentUpdateContext(self.fault_state, update_always=False):
                 with self.client_error_context:
@@ -134,21 +132,28 @@ class ChargepointModule(AbstractChargepoint):
                         self.delay_second_cp(self.CP1_DELAY)
                         with self._client.client:
                             if self.version:
-                                self._client.evse_client.set_current(current, force=force)
+                                self._client.evse_client.set_current(current)
                             else:
-                                self._client.evse_client.set_current(0, force=True)
+                                self._client.evse_client.set_current(0)
                     except AttributeError:
                         self._create_client()
                         self._validate_version()
 
     def switch_phases(self, phases_to_use: int) -> None:
         if self.version is not None:
+            # Der Übergangsfilter hat Vorrang. Erst warten, bis die Abschaltung erlaubt ist, dann
+            # umschalten -- unter Last darf das Relais nicht schalten. Läuft ohnehin in einem
+            # eigenen Thread (control/phase_switch.py). Ausserhalb des Client-Kontextes warten,
+            # damit die Modbus-Verbindung nicht minutenlang offen steht.
+            if not evse_transition_filter.wait_for_window(self._client.evse_client.id, 0):
+                log.error(f"Phasenumschaltung an LP{self.config.id} abgebrochen: die EVSE darf noch nicht "
+                          "abgeschaltet werden. Die Umschaltung wird spaeter erneut angefordert.")
+                return
             with SingleComponentUpdateContext(self.fault_state, update_always=False):
                 with self.client_error_context:
                     try:
                         with self._client.client:
-                            # Phasenumschaltung: der Filter darf die Abschaltung nicht verzögern.
-                            self._client.evse_client.set_current(0, force=True)
+                            self._client.evse_client.set_current(0, wait=True)
                             time.sleep(5)
                             if phases_to_use == 1:
                                 self._client.client.delegate.write_register(
