@@ -123,7 +123,10 @@ class ChargepointModule(AbstractChargepoint):
 
     def set_current(self, current: float) -> None:
         if self.version is not None:
-            if self.client_error_context.error_counter_exceeded():
+            # Abschaltungen wegen Kommunikationsfehlern und die Notabschaltung ohne Versions-Info sind
+            # Sicherheitsfunktionen und umgehen daher den EVSE-Übergangsfilter.
+            force = self.client_error_context.error_counter_exceeded()
+            if force:
                 current = 0
             with SingleComponentUpdateContext(self.fault_state, update_always=False):
                 with self.client_error_context:
@@ -131,9 +134,9 @@ class ChargepointModule(AbstractChargepoint):
                         self.delay_second_cp(self.CP1_DELAY)
                         with self._client.client:
                             if self.version:
-                                self._client.evse_client.set_current(current)
+                                self._client.evse_client.set_current(current, force=force)
                             else:
-                                self._client.evse_client.set_current(0)
+                                self._client.evse_client.set_current(0, force=True)
                     except AttributeError:
                         self._create_client()
                         self._validate_version()
@@ -144,7 +147,8 @@ class ChargepointModule(AbstractChargepoint):
                 with self.client_error_context:
                     try:
                         with self._client.client:
-                            self._client.evse_client.set_current(0)
+                            # Phasenumschaltung: der Filter darf die Abschaltung nicht verzögern.
+                            self._client.evse_client.set_current(0, force=True)
                             time.sleep(5)
                             if phases_to_use == 1:
                                 self._client.client.delegate.write_register(

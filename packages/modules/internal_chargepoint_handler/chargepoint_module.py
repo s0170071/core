@@ -144,7 +144,8 @@ class ChargepointModule(AbstractChargepoint):
     def perform_phase_switch(self, phases_to_use: int) -> None:
         gpio_cp, gpio_relay = self._client.get_pins_phase_switch(phases_to_use)
         with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            self._client.evse_client.set_current(0)
+            # Phasenumschaltung: der Filter darf die Abschaltung nicht verzögern.
+            self._client.evse_client.set_current(0, force=True)
         time.sleep(5)
         GPIO.output(gpio_cp, GPIO.HIGH)  # CP off
         GPIO.output(gpio_relay, GPIO.HIGH)  # 3 on/off
@@ -157,7 +158,8 @@ class ChargepointModule(AbstractChargepoint):
     def perform_cp_interruption(self, duration: int) -> None:
         gpio_cp = self._client.get_pins_cp_interruption()
         with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            self._client.evse_client.set_current(0)
+            # CP-Unterbrechung: der Filter darf die Abschaltung nicht verzögern.
+            self._client.evse_client.set_current(0, force=True)
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BOARD)
         GPIO.setup(gpio_cp, GPIO.OUT)
