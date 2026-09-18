@@ -9,13 +9,15 @@ Thread-safety contract
   copy `data.data.copy_data()`.
 * The algorithm (`HandlerAlgorithm.handler10Sec`) acquires
   `snapshot_lock()` for the entire phase B/C duration.
-* The runner takes `snapshot_lock()` only around the final
-  `data.data.copy_data()` call. During `get_values()` itself the runner
-  does NOT hold the lock — `loadvars.get_values()` mutates
-  `data.data.bat_data` / `pv_data` / `counter_data` incrementally via
-  `copy_module_data()`, exactly as in the original synchronous flow. The
-  algorithm reads from `data.data.*` either between cycles (lock free)
-  or during the final copy (serialised by the lock).
+* The runner does not hold the lock during device I/O in `get_values()`.
+  Instead `data.data.copy_data()` and `data.data.copy_module_data()`
+  acquire it themselves. Both replace the objects in `data.data`
+  wholesale, which resets algorithm-internal state that is never
+  received via MQTT (`Counter.data.set.raw_currents_left`,
+  `raw_power_left`, `BatAll.data.set.*`). Without that lock a
+  `copy_module_data()` from `get_values()` can land between
+  `prep.setup_algorithm()` and the loadmanagement stage, zeroing
+  `raw_currents_left` and making the algorithm allocate 0 A.
 """
 import logging
 import threading
@@ -36,7 +38,7 @@ class LoadvarsRunner:
     def __init__(self, loadvars_: "loadvars.Loadvars"):
         self._loadvars = loadvars_
         self._stop = threading.Event()
-        self._snapshot_lock = threading.RLock()
+        self._snapshot_lock = data.snapshot_lock
         self._cycle_done = threading.Event()
         self._fresh_request = threading.Event()
         self._last_cycle_end = 0.0
