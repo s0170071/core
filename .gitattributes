@@ -1,0 +1,23 @@
+# Normalise line endings.
+#
+# openWB runs on Linux (Raspberry Pi); shell scripts, systemd units and cron
+# files must be LF in the working tree even when edited on Windows. Without
+# this, a Windows checkout can silently produce CRLF files whose committed
+# blobs are LF, which inflates diffs against upstream by thousands of lines.
+* text=auto eol=lf
+
+# Binary types, declared explicitly so they are never line-ending converted
+# even if content sniffing misclassifies them.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.gz   binary
+*.zip  binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.eot  binary
+*.otf  binary
