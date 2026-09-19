@@ -268,6 +268,8 @@ class Counter:
 
     def calc_switch_on_power(self, chargepoint: Chargepoint) -> Tuple[float, float]:
         surplus = self.calc_raw_surplus() - self.data.set.reserved_surplus
+        # Die freigegebene Speicher-Entladeleistung darf eine Ladung halten, aber keine starten.
+        surplus -= bat_buffer.discharge_allowance()
         control_parameter = chargepoint.data.control_parameter
         pv_config = data.data.general_data.data.chargemode_config.pv_charging
 

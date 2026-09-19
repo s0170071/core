@@ -182,6 +182,9 @@ def record_write(evse_id: int, formatted_current: int) -> None:
             state = _state(evse_id)
             is_zero = formatted_current == 0
             now = time.monotonic()
+            # Einzige positive Spur eines echten Schreibzugriffs auf Register 1000: ohne sie ist im Log
+            # nicht unterscheidbar, ob nichts geschrieben wurde oder nur nichts unterdrückt wurde.
+            log.warning(f"EVSE id={evse_id}: register 1000 written, value={formatted_current}")
             if is_zero:
                 state.last_zero_ts = now
             else:

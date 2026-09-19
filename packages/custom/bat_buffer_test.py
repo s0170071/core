@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Optional
 from unittest.mock import Mock
 
@@ -12,6 +13,10 @@ from control.general import General
 from control.limiting_value import LimitingValue, LoadmanagementLimit
 from custom import bat_buffer
 
+# Die autouse-Fixture ersetzt sun_is_high_enough; die Tests der Funktion selbst
+# brauchen das Original.
+_REAL_SUN_IS_HIGH_ENOUGH = bat_buffer.sun_is_high_enough
+
 
 @pytest.fixture(autouse=True)
 def bat_buffer_fixture(monkeypatch) -> None:
@@ -24,6 +29,8 @@ def bat_buffer_fixture(monkeypatch) -> None:
     data.data.general_data.data.chargemode_config.pv_charging.bat_mode = BatConsiderationMode.MIN_SOC_BAT.value
     # Der Latch lebt auf Modul-Ebene und muss zwischen den Tests zurückgesetzt werden.
     monkeypatch.setattr(bat_buffer, "_buffering", False)
+    # Sonst haengen alle Tests an der Uhrzeit, zu der sie laufen.
+    monkeypatch.setattr(bat_buffer, "sun_is_high_enough", lambda: True)
 
 
 def make_chargepoint(state: ChargepointState = ChargepointState.CHARGING_ALLOWED,
@@ -31,7 +38,9 @@ def make_chargepoint(state: ChargepointState = ChargepointState.CHARGING_ALLOWED
                      chargemode: Chargemode = Chargemode.PV_CHARGING,
                      submode: Chargemode = Chargemode.PV_CHARGING,
                      prevent_charge_stop: bool = False,
-                     limiting_value: Optional[LimitingValue] = None) -> Mock:
+                     limiting_value: Optional[LimitingValue] = None,
+                     current_prev: float = 6,
+                     charge_state: bool = True) -> Mock:
     cp = Mock()
     cp.num = 1
     control_parameter = cp.data.control_parameter
@@ -43,6 +52,8 @@ def make_chargepoint(state: ChargepointState = ChargepointState.CHARGING_ALLOWED
     control_parameter.limit = LoadmanagementLimit(None, limiting_value)
     control_parameter.timestamp_switch_on_off = 1652683252.0
     cp.data.set.current = current
+    cp.data.set.current_prev = current_prev
+    cp.data.get.charge_state = charge_state
     cp.data.set.required_power = 1380
     cp.data.set.charging_ev_data.ev_template.data.prevent_charge_stop = prevent_charge_stop
     return cp
@@ -191,6 +202,109 @@ def test_block_switch_on_ignores_other_chargemodes():
     assert bat_buffer.block_switch_on(counter, cp) is False
 
 
+# sun_elevation() / sun_is_high_enough()
+
+@pytest.mark.parametrize("when, expected",
+                         [pytest.param(datetime(2026, 6, 21, 11, 15, tzinfo=timezone.utc), 62.3,
+                                       id="summer solstice, solar noon"),
+                          pytest.param(datetime(2026, 12, 21, 11, 15, tzinfo=timezone.utc), 15.4,
+                                       id="winter solstice, solar noon"),
+                          pytest.param(datetime(2026, 9, 19, 17, 30, tzinfo=timezone.utc), -1.8,
+                                       id="after sunset is negative")])
+def test_sun_elevation(when: datetime, expected: float):
+    # execution
+    elevation = bat_buffer.sun_elevation(when)
+
+    # evaluation: die Naeherung ist auf deutlich unter 1 Grad genau
+    assert elevation == pytest.approx(expected, abs=1.0)
+
+
+def test_sun_elevation_peaks_around_solar_noon():
+    """Sanity-Check ohne Referenzwert: das Maximum liegt nahe dem wahren Mittag."""
+    # setup
+    day = [datetime(2026, 6, 21, h, 0, tzinfo=timezone.utc) for h in range(24)]
+
+    # execution
+    peak = max(day, key=bat_buffer.sun_elevation)
+
+    # evaluation: Laengengrad 10.45 Grad Ost -> wahrer Mittag ca. 11:18 UTC
+    assert peak.hour in (11, 12)
+
+
+@pytest.mark.parametrize("elevation, expected",
+                         [pytest.param(35.0, True, id="high sun buffers"),
+                          pytest.param(20.0, True, id="exactly at the threshold still buffers"),
+                          pytest.param(19.9, False, id="below the threshold does not"),
+                          pytest.param(-5.0, False, id="night does not")])
+def test_sun_is_high_enough(elevation: float, expected: bool, monkeypatch):
+    # setup
+    monkeypatch.setattr(bat_buffer, "sun_is_high_enough", _REAL_SUN_IS_HIGH_ENOUGH)
+    monkeypatch.setattr(bat_buffer, "sun_elevation", lambda when=None: elevation)
+
+    # execution / evaluation
+    assert bat_buffer.sun_is_high_enough() == expected
+
+
+def test_sun_is_high_enough_fails_open(monkeypatch):
+    # setup
+    monkeypatch.setattr(bat_buffer, "sun_is_high_enough", _REAL_SUN_IS_HIGH_ENOUGH)
+    monkeypatch.setattr(bat_buffer, "sun_elevation", Mock(side_effect=ValueError))
+
+    # execution / evaluation
+    assert bat_buffer.sun_is_high_enough() is True
+
+
+def test_buffering_releases_latch_when_sun_is_low(monkeypatch):
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    monkeypatch.setattr(bat_buffer, "sun_is_high_enough", lambda: False)
+    data.data.bat_all_data.data.get.soc = 100
+
+    # execution / evaluation
+    assert bat_buffer.buffering() is False
+
+
+def test_switch_off_decision_defers_to_upstream_when_sun_is_low(monkeypatch):
+    """Bei tiefer Sonne zieht sich der Puffer zurueck, statt hart abzuschalten."""
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    monkeypatch.setattr(bat_buffer, "sun_is_high_enough", lambda: False)
+    data.data.bat_all_data.data.get.soc = 100
+    cp = make_chargepoint()
+
+    # execution / evaluation
+    assert bat_buffer.switch_off_decision(cp) is None
+
+
+# discharge_allowance()
+@pytest.mark.parametrize("discharge_active, hysteresis, power_left, expected",
+                         [pytest.param(True, True, 1000, 1000, id="granted allowance is excluded"),
+                          pytest.param(True, True, 400, 400, id="never more than actually granted"),
+                          pytest.param(True, True, -200, 0, id="negative power left excludes nothing"),
+                          pytest.param(True, False, 1000, 0, id="no hysteresis discharge, nothing excluded"),
+                          pytest.param(False, True, 1000, 0, id="discharge inactive, nothing excluded")])
+def test_discharge_allowance(discharge_active: bool, hysteresis: bool, power_left: float, expected: float):
+    # setup
+    pv_config = data.data.general_data.data.chargemode_config.pv_charging
+    pv_config.bat_power_discharge_active = discharge_active
+    pv_config.bat_power_discharge = 1000
+    data.data.bat_all_data.data.set.hysteresis_discharge = hysteresis
+    data.data.bat_all_data.data.set.charging_power_left = power_left
+
+    # execution / evaluation
+    assert bat_buffer.discharge_allowance() == expected
+
+
+def test_discharge_allowance_inactive_feature(monkeypatch):
+    # setup
+    data.data.general_data.data.chargemode_config.pv_charging.bat_mode = BatConsiderationMode.BAT_MODE.value
+    data.data.bat_all_data.data.set.hysteresis_discharge = True
+    data.data.bat_all_data.data.set.charging_power_left = 1000
+
+    # execution / evaluation
+    assert bat_buffer.discharge_allowance() == 0.0
+
+
 # switch_off_decision()
 
 def test_switch_off_decision_vetoes_while_buffering(monkeypatch):
@@ -201,6 +315,27 @@ def test_switch_off_decision_vetoes_while_buffering(monkeypatch):
 
     # execution / evaluation
     assert bat_buffer.switch_off_decision(cp) is True
+
+
+def test_switch_off_decision_defers_when_charge_not_flowing(monkeypatch):
+    """Ein Veto haelt nur eine laufende Ladung, es startet keine."""
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    data.data.bat_all_data.data.get.soc = 60
+    cp = make_chargepoint(current_prev=0, charge_state=False)
+
+    # execution / evaluation
+    assert bat_buffer.switch_off_decision(cp) is None
+
+
+def test_switch_off_decision_defers_without_flow_even_above_max_bat_soc(monkeypatch):
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    data.data.bat_all_data.data.get.soc = 80
+    cp = make_chargepoint(current_prev=0, charge_state=False)
+
+    # execution / evaluation
+    assert bat_buffer.switch_off_decision(cp) is None
 
 
 def test_switch_off_decision_stops_below_min_soc(monkeypatch):
@@ -316,6 +451,54 @@ def test_apply_min_current_floor_skips_non_charging_state(monkeypatch):
 
     # evaluation
     assert cp.data.set.current == 0
+
+
+@pytest.mark.parametrize("state",
+                         [pytest.param(ChargepointState.SWITCH_OFF_DELAY, id="switch off delay"),
+                          pytest.param(ChargepointState.WAIT_FOR_USING_PHASES, id="after phase switch"),
+                          pytest.param(ChargepointState.PHASE_SWITCH_AWAITED, id="phase switch awaited")])
+def test_apply_min_current_floor_does_not_restart_below_max_bat_soc(state: ChargepointState, monkeypatch):
+    """Der Boden haelt eine laufende Ladung, er startet keine: sonst wuerde may_start() umgangen."""
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    data.data.bat_all_data.data.get.soc = 60
+    cp = make_chargepoint(current=0, state=state, current_prev=0, charge_state=False)
+    monkeypatch.setattr(filter_chargepoints, "get_chargepoints_by_chargemode", Mock(return_value=[cp]))
+
+    # execution
+    bat_buffer.apply_min_current_floor()
+
+    # evaluation
+    assert cp.data.set.current == 0
+
+
+def test_apply_min_current_floor_does_not_start_even_above_max_bat_soc(monkeypatch):
+    """Oberhalb von max_bat_soc darf nur der Einschaltpfad starten, der den Ueberschuss prueft."""
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    data.data.bat_all_data.data.get.soc = 80
+    cp = make_chargepoint(current=0, state=ChargepointState.SWITCH_OFF_DELAY, current_prev=0, charge_state=False)
+    monkeypatch.setattr(filter_chargepoints, "get_chargepoints_by_chargemode", Mock(return_value=[cp]))
+
+    # execution
+    bat_buffer.apply_min_current_floor()
+
+    # evaluation
+    assert cp.data.set.current == 0
+
+
+def test_apply_min_current_floor_holds_charge_that_is_still_flowing(monkeypatch):
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    data.data.bat_all_data.data.get.soc = 60
+    cp = make_chargepoint(current=0, state=ChargepointState.SWITCH_OFF_DELAY, current_prev=0, charge_state=True)
+    monkeypatch.setattr(filter_chargepoints, "get_chargepoints_by_chargemode", Mock(return_value=[cp]))
+
+    # execution
+    bat_buffer.apply_min_current_floor()
+
+    # evaluation
+    assert cp.data.set.current == 6
 
 
 @pytest.mark.parametrize("limiting_value, expected",

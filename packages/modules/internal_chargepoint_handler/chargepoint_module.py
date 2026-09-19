@@ -144,16 +144,24 @@ class ChargepointModule(AbstractChargepoint):
 
     def perform_phase_switch(self, phases_to_use: int) -> None:
         gpio_cp, gpio_relay = self._client.get_pins_phase_switch(phases_to_use)
+        evse = self._client.evse_client
         # Der Übergangsfilter hat Vorrang. Erst warten, bis die Abschaltung erlaubt ist, dann
         # umschalten -- unter Last darf das Relais nicht schalten. Läuft ohnehin in einem eigenen
         # Thread (internal_chargepoint_handler.__thread_phase_switch).
-        if not evse_transition_filter.wait_for_window(self._client.evse_client.id, 0):
+        if not evse_transition_filter.wait_for_window(evse.id, 0):
             log.error(f"Phasenumschaltung an LP{self.local_charge_point_num} abgebrochen: die EVSE darf noch "
                       "nicht abgeschaltet werden. Die Umschaltung wird spaeter erneut angefordert.")
             return
-        with SingleComponentUpdateContext(self.fault_state, update_always=False):
-            self._client.evse_client.set_current(0, wait=True)
-        time.sleep(5)
+        with SingleComponentUpdateContext(self.fault_state, update_always=False, reraise=True):
+            evse.set_current(0, wait=True)
+            for _ in range(20):
+                _, _, evse_current = evse.get_plug_charge_state()
+                if evse_current == 0:
+                    break
+                time.sleep(0.5)
+                evse.set_current(0, wait=True)
+            else:
+                raise Exception("Ladung konnte nicht gestoppt werden - Phasenumschaltung abgebrochen.")
         GPIO.output(gpio_cp, GPIO.HIGH)  # CP off
         GPIO.output(gpio_relay, GPIO.HIGH)  # 3 on/off
         time.sleep(5)
@@ -161,6 +169,7 @@ class ChargepointModule(AbstractChargepoint):
         time.sleep(5)
         GPIO.output(gpio_cp, GPIO.LOW)  # CP on
         time.sleep(1)
+        self.old_phases_in_use = phases_to_use
 
     def perform_cp_interruption(self, duration: int) -> None:
         gpio_cp = self._client.get_pins_cp_interruption()
