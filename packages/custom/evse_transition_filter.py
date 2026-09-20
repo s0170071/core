@@ -31,6 +31,14 @@ Drei Eigenschaften, die gelten müssen:
    :func:`wait_for_window`, bis die Abschaltung erlaubt ist. Kommt die Freigabe
    nicht rechtzeitig, unterbleibt die Umschaltung -- sie wird später erneut
    angefordert.
+4. **Die abgewartete Abschaltung zieht kein neues Fenster auf.** Sie wird zwar
+   protokolliert und für die Relay-Loop-Diagnose gezählt, setzt aber
+   ``last_zero_ts`` nicht (``arm_window=False`` in :func:`record_write`).
+   Andernfalls wäre der Wiederanlauf direkt nach der Umschaltung für
+   ``MIN_OFF_TIME_S`` gesperrt, das Fahrzeug bekäme also minutenlang 0A
+   angeboten -- obwohl der Aufrufer die Mindest-Ein-Zeit bereits voll
+   abgewartet hat. Das ist keine Umgehung: geschaltet wird erst, wenn das
+   Fenster offen ist; nur die Buchführung danach unterbleibt.
 
 Der Zustand liegt bewusst auf Modul-Ebene und wird über ``evse_id`` getrennt
 gehalten.
@@ -175,8 +183,14 @@ def wait_for_window(evse_id: int, formatted_current: int, timeout: float = MAX_W
         return False
 
 
-def record_write(evse_id: int, formatted_current: int) -> None:
-    """Meldet einen tatsächlich erfolgten Schreibzugriff zurück."""
+def record_write(evse_id: int, formatted_current: int, arm_window: bool = True) -> None:
+    """Meldet einen tatsächlich erfolgten Schreibzugriff zurück.
+
+    :param arm_window: False für Schreibzugriffe, die über :func:`wait_for_window`
+                       bereits auf das Fenster gewartet haben. Sie werden
+                       protokolliert und gezählt, ziehen aber kein neues Fenster
+                       auf -- siehe Punkt 4 im Modul-Docstring.
+    """
     try:
         with _lock:
             state = _state(evse_id)
@@ -184,11 +198,13 @@ def record_write(evse_id: int, formatted_current: int) -> None:
             now = time.monotonic()
             # Einzige positive Spur eines echten Schreibzugriffs auf Register 1000: ohne sie ist im Log
             # nicht unterscheidbar, ob nichts geschrieben wurde oder nur nichts unterdrückt wurde.
-            log.warning(f"EVSE id={evse_id}: register 1000 written, value={formatted_current}")
-            if is_zero:
-                state.last_zero_ts = now
-            else:
-                state.last_nonzero_ts = now
+            log.warning(f"EVSE id={evse_id}: register 1000 written, value={formatted_current}"
+                        f"{'' if arm_window else ' (awaited, window not re-armed)'}")
+            if arm_window:
+                if is_zero:
+                    state.last_zero_ts = now
+                else:
+                    state.last_nonzero_ts = now
             if state.last_was_zero is not None and is_zero != state.last_was_zero:
                 state.transitions.append(now)
                 state.transitions = [t for t in state.transitions if now - t <= TOGGLE_WINDOW_S]

@@ -182,6 +182,57 @@ def test_wait_ist_fail_safe_nicht_fail_open(clock, monkeypatch):
     assert filt.wait_for_window(1, 0) is False
 
 
+# Eigenschaft 4: die abgewartete Abschaltung zieht kein neues Fenster auf
+
+
+def switch(evse_id: int) -> bool:
+    """Bildet die Abschaltung einer Phasenumschaltung nach (set_current(0, wait=True))."""
+    if not filt.wait_for_window(evse_id, 0):
+        return False
+    filt.record_write(evse_id, 0, arm_window=False)
+    return True
+
+
+def test_wiederanlauf_nach_phasenumschaltung_ist_nicht_gesperrt(clock, monkeypatch):
+    def fake_sleep(seconds):
+        clock[0] += seconds
+    monkeypatch.setattr(filt.time, "sleep", fake_sleep)
+    assert write(1, 6) is True
+    clock[0] += 10
+    assert switch(1) is True
+    # Umschaltung dauert ein paar Sekunden, danach will die Regelung sofort wieder laden.
+    clock[0] += 12
+    assert write(1, 6) is True
+
+
+def test_normale_abschaltung_sperrt_den_wiederanlauf_weiterhin(clock):
+    """Die Ausnahme gilt nur fuer abgewartete Schreibzugriffe."""
+    assert write(1, 6) is True
+    clock[0] += filt.MIN_ON_TIME_S
+    assert write(1, 0) is True
+    clock[0] += 12
+    assert write(1, 6) is False
+
+
+def test_abgewartete_abschaltung_umgeht_die_mindest_ein_zeit_nicht(clock, monkeypatch):
+    """arm_window ist keine Umgehung: geht das Fenster nicht auf, wird nicht geschaltet."""
+    def fake_sleep(seconds):
+        clock[0] += seconds
+    monkeypatch.setattr(filt.time, "sleep", fake_sleep)
+    monkeypatch.setattr(filt, "remaining", lambda *a: 999.0)
+    monkeypatch.setattr(filt, "log", Mock())
+    assert switch(1) is False
+
+
+def test_abgewartete_abschaltung_zaehlt_fuer_die_relay_loop_diagnose(clock, monkeypatch):
+    mock_log = Mock()
+    monkeypatch.setattr(filt, "log", mock_log)
+    for current in (6, 0, 6, 0):
+        filt.record_write(1, current, arm_window=False)
+        clock[0] += 1
+    assert "possible relay loop" in warnings(mock_log)
+
+
 # Trennung nach evse_id
 
 

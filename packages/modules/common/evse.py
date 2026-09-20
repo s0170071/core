@@ -126,4 +126,5 @@ class Evse:
             if not evse_transition_filter.allow_write(self.id, formatted_current):
                 return
             self.client.write_register(1000, formatted_current, unit=self.id)
-            evse_transition_filter.record_write(self.id, formatted_current)
+            # Ein abgewarteter Schreibzugriff darf den Wiederanlauf nach der Umschaltung nicht sperren.
+            evse_transition_filter.record_write(self.id, formatted_current, arm_window=not wait)
