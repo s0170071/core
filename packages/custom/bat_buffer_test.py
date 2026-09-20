@@ -305,6 +305,78 @@ def test_discharge_allowance_inactive_feature(monkeypatch):
     assert bat_buffer.discharge_allowance() == 0.0
 
 
+# clamp_charging_power_left()
+
+@pytest.mark.parametrize("soc, bat_power, charging_power_left, expected",
+                         [pytest.param(60, 3000, 4000, 1000,
+                                       id="charging battery is not handed to the car"),
+                          pytest.param(60, -2500, -1500, -1500,
+                                       id="discharging battery passes through unchanged"),
+                          pytest.param(60, 0, 1000, 1000, id="idle battery keeps the allowance"),
+                          pytest.param(60, 3000, 200, 200, id="never raises above upstream"),
+                          pytest.param(80, 3000, 4000, 4000,
+                                       id="above max_bat_soc upstream decides"),
+                          pytest.param(70, 3000, 4000, 1000, id="exactly max_bat_soc is still clamped")])
+def test_clamp_charging_power_left(soc: int, bat_power: float, charging_power_left: float, expected: float,
+                                   monkeypatch):
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    pv_config = data.data.general_data.data.chargemode_config.pv_charging
+    pv_config.bat_power_discharge_active = True
+    pv_config.bat_power_discharge = 1000
+    data.data.bat_all_data.data.get.soc = soc
+    data.data.bat_all_data.data.get.power = bat_power
+
+    # execution / evaluation
+    assert bat_buffer.clamp_charging_power_left(charging_power_left) == expected
+
+
+def test_clamp_charging_power_left_without_discharge_allowance(monkeypatch):
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    pv_config = data.data.general_data.data.chargemode_config.pv_charging
+    pv_config.bat_power_discharge_active = False
+    pv_config.bat_power_discharge = 1000
+    data.data.bat_all_data.data.get.soc = 60
+    data.data.bat_all_data.data.get.power = 3000
+
+    # execution / evaluation
+    assert bat_buffer.clamp_charging_power_left(3000) == 0
+
+
+@pytest.mark.parametrize("latch, bat_mode",
+                         [pytest.param(False, BatConsiderationMode.MIN_SOC_BAT.value, id="not buffering"),
+                          pytest.param(True, BatConsiderationMode.BAT_MODE.value, id="feature inactive")])
+def test_clamp_charging_power_left_defers_to_upstream(latch: bool, bat_mode: str, monkeypatch):
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", latch)
+    pv_config = data.data.general_data.data.chargemode_config.pv_charging
+    pv_config.bat_mode = bat_mode
+    pv_config.bat_power_discharge_active = True
+    pv_config.bat_power_discharge = 1000
+    data.data.bat_all_data.data.get.soc = 60
+    data.data.bat_all_data.data.get.power = 3000
+
+    # execution / evaluation
+    assert bat_buffer.clamp_charging_power_left(4000) == 4000
+
+
+@pytest.mark.parametrize("cp_current", [pytest.param(6, id="at min_current"), pytest.param(16, id="well above")])
+def test_clamp_charging_power_left_ignores_charging_current(cp_current: float, monkeypatch):
+    """Die Entladefreigabe haengt nicht am Ladestrom -- den stellt die Regelung ein."""
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    pv_config = data.data.general_data.data.chargemode_config.pv_charging
+    pv_config.bat_power_discharge_active = True
+    pv_config.bat_power_discharge = 1000
+    data.data.bat_all_data.data.get.soc = 60
+    data.data.bat_all_data.data.get.power = -800
+    data.data.cp_data = {"cp1": make_chargepoint(current=cp_current, current_prev=cp_current)}
+
+    # execution / evaluation
+    assert bat_buffer.clamp_charging_power_left(200) == 200
+
+
 # switch_off_decision()
 
 def test_switch_off_decision_vetoes_while_buffering(monkeypatch):
@@ -537,3 +609,47 @@ def test_suppress_3_to_1(latch: bool, soc: int, chargemode: Chargemode, expected
 
     # execution / evaluation
     assert bat_buffer.suppress_3_to_1(cp.data.control_parameter) == expected
+
+
+# Wolkendurchgang: aus einem hoeheren Strom heraus darf nicht direkt abgeschaltet werden.
+
+@pytest.mark.parametrize("current", [pytest.param(8, id="8A"), pytest.param(16, id="16A")])
+def test_cloud_does_not_switch_off_from_elevated_current(current: float, monkeypatch):
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    data.data.bat_all_data.data.get.soc = 60
+    cp = make_chargepoint(current=current, current_prev=current)
+
+    # execution / evaluation
+    assert bat_buffer.switch_off_decision(cp) is True
+
+
+def test_cloud_keeps_elevated_current_until_regulation_lowers_it(monkeypatch):
+    """Der Boden senkt nicht: der Strom laeuft ueber die Ueberschussregelung nach unten."""
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    data.data.bat_all_data.data.get.soc = 60
+    cp = make_chargepoint(current=8, current_prev=8)
+    monkeypatch.setattr(filter_chargepoints, "get_chargepoints_by_chargemode", Mock(return_value=[cp]))
+
+    # execution
+    bat_buffer.apply_min_current_floor()
+
+    # evaluation
+    assert cp.data.set.current == 8
+
+
+def test_cloud_catches_charge_that_regulation_zeroed(monkeypatch):
+    """Faellt die Zuteilung unter min_current, faengt der Boden sie im selben Zyklus wieder auf."""
+    # setup
+    monkeypatch.setattr(bat_buffer, "_buffering", True)
+    data.data.bat_all_data.data.get.soc = 60
+    cp = make_chargepoint(current=0, current_prev=8)
+    monkeypatch.setattr(filter_chargepoints, "get_chargepoints_by_chargemode", Mock(return_value=[cp]))
+
+    # execution
+    bat_buffer.apply_min_current_floor()
+
+    # evaluation
+    assert cp.data.set.current == 6
+    assert bat_buffer.switch_off_decision(cp) is True

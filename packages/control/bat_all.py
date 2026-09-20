@@ -26,6 +26,7 @@ from control import data
 from control.algorithm.chargemodes import CONSIDERED_CHARGE_MODES_CHARGING
 from control.algorithm.filter_chargepoints import get_chargepoints_with_required_current_by_chargemode
 from control.pv import Pv
+from custom import bat_buffer
 from helpermodules.constants import NO_ERROR
 from modules.common.abstract_device import AbstractDevice
 from modules.common.component_context import SingleComponentUpdateContext
@@ -461,6 +462,7 @@ class BatAll:
                 log.debug("Damit der Speicher hochregeln kann, muss unabhängig vom eingestellten Regelmodus "
                           "Einspeisung erzeugt werden.")
                 charging_power_left -= 100
+            charging_power_left = bat_buffer.clamp_charging_power_left(charging_power_left)
             self.data.set.charging_power_left = self._limit_bat_power_discharge(charging_power_left)
         except Exception:
             log.exception("Fehler im Bat-Modul")

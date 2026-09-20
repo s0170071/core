@@ -59,6 +59,8 @@ FLOOR_WOULD_START = ("Mindeststrom aus dem Speicher-Puffer wird nicht gesetzt, d
                      "Puffer hält eine Ladung, er startet keine.")
 SWITCH_OFF_VETOED = "Abschaltung wird verhindert, da der Speicher mit {}% die Ladung puffert."
 SUN_TOO_LOW = "Speicher-Puffer deaktiviert: Sonnenstand {:.1f}° liegt unter {:.0f}°."
+CLAMPED = ("Nutzbare Speicher-Leistung wird von {:.0f}W auf {:.0f}W begrenzt, damit sich der Puffer wieder "
+           "füllen kann.")
 
 # Standort für die Sonnenstandsberechnung. openWB kennt keine Koordinaten, daher
 # fest hinterlegt. Ein Fehler von 1° verschiebt den Schaltzeitpunkt um wenige
@@ -204,6 +206,45 @@ def discharge_allowance() -> float:
     except Exception:
         log.exception("Fehler im Speicher-Puffer")
         return 0.0
+
+
+def clamp_charging_power_left(charging_power_left: float) -> float:
+    """Begrenzt die Speicher-Leistung, die der Regelung als Überschuss angeboten wird.
+
+    Upstream schlägt im Band zwischen ``min_bat_soc`` und ``max_bat_soc`` die
+    *Ladeleistung* des Speichers auf die freigegebene Entladeleistung auf. Kommt die
+    Sonne nach einer Wolke zurück, nimmt das Fahrzeug damit genau die Leistung weg,
+    mit der sich der Puffer wieder füllen müsste -- der SoC bleibt am unteren Rand
+    kleben, statt zurück auf ``max_bat_soc`` zu laufen.
+
+    Während gepuffert wird zählt deshalb nur der *entladende* Anteil der
+    Speicher-Leistung. Oberhalb von ``max_bat_soc`` bleibt es bei Upstream: dort soll
+    der Speicher abgeben, statt über die Grenze hinaus zu horten.
+
+    Die Entladefreigabe selbst hängt bewusst nicht am Ladestrom. Sie wird unverändert
+    angeboten, den Strom stellt die Überschussregelung ein -- so läuft das Fahrzeug
+    aus einem höheren Strom heraus kontrolliert nach unten, statt abgeschaltet zu
+    werden.
+
+    Der Rückgabewert ist nie größer als der übergebene: der Puffer schränkt ein, er
+    gibt nie zusätzliche Leistung frei.
+    """
+    try:
+        if not active() or not buffering():
+            return charging_power_left
+        pv_config = _pv_config()
+        bat_all_get = data.data.bat_all_data.data.get
+        if bat_all_get.soc > pv_config.max_bat_soc:
+            return charging_power_left
+        discharge_rate = pv_config.bat_power_discharge if pv_config.bat_power_discharge_active else 0
+        limit = discharge_rate + min(0, bat_all_get.power)
+        if limit < charging_power_left:
+            log.info(CLAMPED.format(charging_power_left, limit))
+            return limit
+        return charging_power_left
+    except Exception:
+        log.exception("Fehler im Speicher-Puffer")
+        return charging_power_left
 
 
 def _charge_is_flowing(chargepoint) -> bool:
