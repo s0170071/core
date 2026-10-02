@@ -1,3 +1,4 @@
+import copy
 import logging
 
 from control import data
@@ -48,10 +49,13 @@ class PurgeInverterState:
         self.delegate = delegate
 
     def set(self, state: InverterState) -> None:
+        self._raw_state = state
         self.delegate.set(state)
 
     def update(self) -> None:
-        state = self.filter_peaks(self.delegate.delegate.state)
+        # Kopie, damit bei ausbleibendem set() (Lesefehler) Offset/Hybrid-Korrektur nicht erneut auf den bereits
+        # korrigierten Wert angewendet wird.
+        state = self.filter_peaks(copy.copy(self._raw_state))
         state = self.fix_hybrid_values(state)
         if state.exported is not None:
             offset = get_pv_export_offset(self.delegate.delegate.num)

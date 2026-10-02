@@ -258,6 +258,11 @@ def create_entry(log_type: LogType, sh_log_data: LegacySmartHomeLogData, previou
                     {pv: {"exported": data.data.pv_data[pv].data.get.exported}})
             except Exception:
                 log.exception("Fehler im Werte-Logging-Modul für Wechselrichter "+str(pv))
+        # pv_all kann einen Zyklus ohne ein Modul summiert haben; ein Rücksprung des Gesamtzählers würde beim
+        # Wiederanstieg als Tagesertrag gewertet. Summe daher aus demselben Snapshot wie die Einzelwerte bilden.
+        module_exported = [v["exported"] for k, v in pv_dict.items() if k != "all"]
+        if "all" in pv_dict and module_exported:
+            pv_dict["all"]["exported"] = sum(module_exported)
 
     try:
         bat_dict = {"all": {"imported": data.data.bat_all_data.data.get.imported,

@@ -88,15 +88,32 @@ def test_update_applies_configured_pv_export_offset(monkeypatch):
         {"id": 13, "type": "inverter", "children": []}
     ]
     data.data.pv_data = {"pv13": Mock(data=Mock(config=Mock(max_ac_out=0)))}
-    delegate = Mock(delegate=Mock(num=13, state=InverterState(power=-500, exported=57906298)))
+    delegate = Mock(delegate=Mock(num=13))
     purge = PurgeInverterState(delegate=delegate)
     monkeypatch.setattr("modules.common.store._inverter.get_pv_export_offset", lambda module_num: 53804741.475)
 
+    purge.set(InverterState(power=-500, exported=57906298))
     purge.update()
 
     adjusted_state = delegate.set.call_args.args[0]
     assert adjusted_state.power == -500
     assert adjusted_state.exported == 4101556.525
+
+
+def test_update_without_new_reading_does_not_apply_offset_twice(monkeypatch):
+    data.data.counter_all_data.data.get.hierarchy = [
+        {"id": 13, "type": "inverter", "children": []}
+    ]
+    data.data.pv_data = {"pv13": Mock(data=Mock(config=Mock(max_ac_out=0)))}
+    delegate = Mock(delegate=Mock(num=13))
+    purge = PurgeInverterState(delegate=delegate)
+    monkeypatch.setattr("modules.common.store._inverter.get_pv_export_offset", lambda module_num: 53804741.475)
+
+    purge.set(InverterState(power=-500, exported=57906298))
+    purge.update()
+    purge.update()  # Lesefehler: kein erneutes set()
+
+    assert delegate.set.call_args.args[0].exported == 4101556.525
 
 
 def test_configured_pv_export_offset_is_module_specific():
