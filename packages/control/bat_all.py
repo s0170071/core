@@ -233,6 +233,9 @@ class BatAll:
                     self.data.set.assist_active = False
                 if self.data.set.protect_active and soc >= max_soc:
                     self.data.set.protect_active = False
+                # Battery recovered to max_soc: end ASSIST (and with it the min-current hold).
+                if self.data.set.assist_active and soc >= max_soc:
+                    self.data.set.assist_active = False
 
                 if self.data.set.protect_active:
                     # STATE: PROTECT — soc <= min_soc, battery takes priority.
@@ -271,8 +274,8 @@ class BatAll:
                         log.debug(f"MIN_SOC_BAT ASSIST: discharge_rate={discharge_rate}W, "
                                   f"power={power}W, cpl={charging_power_left}W")
 
-                elif self._ev_at_min_current():
-                    # Entering ASSIST — car at min, soc > min
+                elif soc < max_soc and self._ev_at_min_current():
+                    # Entering ASSIST — car at min, min < soc < max
                     self.data.set.assist_active = True
                     charging_power_left = discharge_rate + min(0, power)
                     log.debug(f"MIN_SOC_BAT ASSIST (enter): discharge_rate={discharge_rate}W, "
@@ -309,6 +312,14 @@ class BatAll:
             if cp.data.get.charge_state:
                 return True
         return False
+
+    def hold_min_current(self) -> bool:
+        """True while the battery recovers after ASSIST: PV charging must not exceed min_current until max_soc."""
+        if not (self.data.config.configured and self.data.get.fault_state == 0 and self.data.set.assist_active):
+            return False
+        pv_config = data.data.general_data.data.chargemode_config.pv_charging
+        return (pv_config.bat_mode == BatConsiderationMode.MIN_SOC_BAT.value and
+                self.data.get.soc < pv_config.max_bat_soc)
 
     def _ev_at_min_current(self) -> bool:
         """True when at least one EV is charging AND all charging EVs are at their min_current."""

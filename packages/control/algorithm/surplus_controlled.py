@@ -40,8 +40,9 @@ class SurplusControlled:
             if preferenced_cps_without_set_current:
                 for cp in preferenced_cps_without_set_current:
                     cp.data.set.current = cp.data.set.target_current
+        hold_min_current = data.data.bat_all_data.hold_min_current()
         for cp in get_chargepoints_with_required_current_by_chargemode(CONSIDERED_CHARGE_MODES_SURPLUS):
-            if cp.data.control_parameter.state in CHARGING_STATES:
+            if cp.data.control_parameter.state in CHARGING_STATES and not hold_min_current:
                 self._fix_deviating_evse_current(cp)
 
     def _set(self,
@@ -81,6 +82,8 @@ class SurplusControlled:
             current = common.get_current_to_set(cp.data.set.current, current, cp.data.set.target_current)
             self._set_loadmangement_message(current, limit, cp)
             limited_current = limit_adjust_current(cp, current)
+            if data.data.bat_all_data.hold_min_current():
+                limited_current = min(limited_current, cp.data.control_parameter.min_current)
             common.set_current_counterdiff(
                 cp.data.control_parameter.min_current,
                 limited_current,

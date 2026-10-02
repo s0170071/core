@@ -717,6 +717,8 @@ class SetData:
                 "openWB/set/bat/config/configured" in msg.topic or
                 "openWB/set/bat/get/power_limit_controllable" in msg.topic or
                     "openWB/set/bat/set/regulate_up" in msg.topic or
+                    "openWB/set/bat/set/protect_active" in msg.topic or
+                    "openWB/set/bat/set/assist_active" in msg.topic or
                     "openWB/set/bat/set/hysteresis_discharge" in msg.topic):
                 self._validate_value(msg, bool)
             elif "openWB/set/bat/set/charging_power_left" in msg.topic:

@@ -65,6 +65,8 @@ class UpdateConfig:
         "^openWB/bat/config/power_limit_mode$",
         "^openWB/bat/set/charging_power_left$",
         "^openWB/bat/set/regulate_up$",
+        "^openWB/bat/set/protect_active$",
+        "^openWB/bat/set/assist_active$",
         "^openWB/bat/get/fault_state$",
         "^openWB/bat/get/fault_str$",
         "^openWB/bat/get/power_limit_controllable$",

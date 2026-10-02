@@ -163,6 +163,36 @@ def test_get_charging_power_left(params: Params, caplog, data_, monkeypatch):
     assert b_all.data.set.regulate_up == params.expected_regulate_up
 
 
+@pytest.mark.parametrize(
+    "soc, power, assist_before, expected_assist, expected_hold",
+    [
+        pytest.param(90, 800, True, True, True, id="PV zurück, Speicher lädt unter max_soc: Mindeststrom halten"),
+        pytest.param(90, -300, True, True, True, id="Speicher entlädt unter max_soc: Mindeststrom halten"),
+        pytest.param(95, 800, True, False, False, id="max_soc erreicht: ASSIST endet, Freigabe"),
+        pytest.param(85, 800, True, False, False, id="min_soc erreicht: PROTECT statt ASSIST"),
+    ])
+def test_hold_min_current_until_max_soc(soc, power, assist_before, expected_assist, expected_hold, data_fixture):
+    # setup
+    b_all = BatAll()
+    b_all.data.config.configured = True
+    b_all.data.get.soc = soc
+    b_all.data.get.power = power
+    b_all.data.set.assist_active = assist_before
+    data.data.general_data.data.chargemode_config.pv_charging = PvCharging(
+        bat_mode="min_soc_bat_mode", min_bat_soc=85, max_bat_soc=95,
+        bat_power_discharge=1000, bat_power_discharge_active=True)
+    cp = Chargepoint(3, None)
+    cp.data.get.charge_state = True
+    data.data.cp_data["cp3"] = cp
+
+    # execution
+    b_all._get_charging_power_left()
+
+    # evaluation
+    assert b_all.data.set.assist_active is expected_assist
+    assert b_all.hold_min_current() is expected_hold
+
+
 def default_chargepoint_factory() -> List[Chargepoint]:
     cp = Chargepoint(3, None)
     cp.data.get.power = 1400
