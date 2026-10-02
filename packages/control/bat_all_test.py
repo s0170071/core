@@ -6,7 +6,7 @@ from packages.conftest import hierarchy_standard
 from control import bat_all
 from control.bat import Bat
 
-from control.bat_all import BatAll, BatPowerLimitMode
+from control.bat_all import BatAll, BatPowerLimitMode, BatState, next_bat_state
 from control import data
 from control.chargepoint.chargepoint import Chargepoint
 from control.chargepoint.chargepoint_all import AllChargepointData, AllChargepoints, AllGet
@@ -163,34 +163,130 @@ def test_get_charging_power_left(params: Params, caplog, data_, monkeypatch):
     assert b_all.data.set.regulate_up == params.expected_regulate_up
 
 
-@pytest.mark.parametrize(
-    "soc, power, assist_before, expected_assist, expected_hold",
-    [
-        pytest.param(90, 800, True, True, True, id="PV zurück, Speicher lädt unter max_soc: Mindeststrom halten"),
-        pytest.param(90, -300, True, True, True, id="Speicher entlädt unter max_soc: Mindeststrom halten"),
-        pytest.param(95, 800, True, False, False, id="max_soc erreicht: ASSIST endet, Freigabe"),
-        pytest.param(85, 800, True, False, False, id="min_soc erreicht: PROTECT statt ASSIST"),
-    ])
-def test_hold_min_current_until_max_soc(soc, power, assist_before, expected_assist, expected_hold, data_fixture):
-    # setup
+@dataclass
+class StateParams:
+    name: str
+    state: BatState
+    soc: float
+    ev_charging: bool
+    ev_at_min: bool
+    expected: BatState
+
+
+state_cases = [
+    StateParams("PRIORITY bleibt, Auto über Mindeststrom", BatState.PRIORITY, 90, True, False, BatState.PRIORITY),
+    StateParams("PRIORITY bleibt, Auto lädt nicht", BatState.PRIORITY, 90, False, False, BatState.PRIORITY),
+    StateParams("PRIORITY -> BUFFER, Auto auf Mindeststrom", BatState.PRIORITY, 90, True, True, BatState.BUFFER),
+    StateParams("PRIORITY bleibt bei max_soc trotz Mindeststrom", BatState.PRIORITY, 95, True, True,
+                BatState.PRIORITY),
+    StateParams("PRIORITY -> PROTECT bei min_soc", BatState.PRIORITY, 85, True, True, BatState.PROTECT),
+    StateParams("BUFFER bleibt unter max_soc, Auto über Mindeststrom", BatState.BUFFER, 90, True, False,
+                BatState.BUFFER),
+    StateParams("BUFFER -> PRIORITY bei max_soc", BatState.BUFFER, 95, True, True, BatState.PRIORITY),
+    StateParams("BUFFER -> PRIORITY, Auto gestoppt", BatState.BUFFER, 90, False, False, BatState.PRIORITY),
+    StateParams("BUFFER -> PROTECT bei min_soc", BatState.BUFFER, 85, True, True, BatState.PROTECT),
+    StateParams("PROTECT bleibt zwischen min und max (Hysterese)", BatState.PROTECT, 90, True, True,
+                BatState.PROTECT),
+    StateParams("PROTECT bleibt bei min_soc", BatState.PROTECT, 85, False, False, BatState.PROTECT),
+    StateParams("PROTECT -> PRIORITY bei max_soc, kein direkter Wechsel in BUFFER", BatState.PROTECT, 95, True, True,
+                BatState.PRIORITY),
+]
+
+
+@pytest.mark.parametrize("params", state_cases, ids=[c.name for c in state_cases])
+def test_next_bat_state(params: StateParams):
+    assert next_bat_state(params.state, params.soc, 85, 95, lambda: params.ev_charging,
+                          lambda: params.ev_at_min) == params.expected
+
+
+def test_next_bat_state_evaluates_ev_predicates_lazily():
+    def fail() -> bool:
+        raise AssertionError("EV-Prädikat darf hier nicht ausgewertet werden")
+
+    assert next_bat_state(BatState.PROTECT, 90, 85, 95, fail, fail) == BatState.PROTECT
+    assert next_bat_state(BatState.PRIORITY, 95, 85, 95, fail, fail) == BatState.PRIORITY
+    assert next_bat_state(BatState.BUFFER, 95, 85, 95, fail, fail) == BatState.PRIORITY
+    assert next_bat_state(BatState.PRIORITY, 85, 85, 95, fail, fail) == BatState.PROTECT
+
+
+def _min_soc_setup(soc, power, state, ev_current=6, bat_mode="min_soc_bat_mode"):
     b_all = BatAll()
     b_all.data.config.configured = True
     b_all.data.get.soc = soc
     b_all.data.get.power = power
-    b_all.data.set.assist_active = assist_before
+    b_all.data.set.state = state
     data.data.general_data.data.chargemode_config.pv_charging = PvCharging(
-        bat_mode="min_soc_bat_mode", min_bat_soc=85, max_bat_soc=95,
+        bat_mode=bat_mode, min_bat_soc=85, max_bat_soc=95,
         bat_power_discharge=1000, bat_power_discharge_active=True)
     cp = Chargepoint(3, None)
     cp.data.get.charge_state = True
+    cp.data.set.current = ev_current
+    cp.data.set.charging_ev_data.ev_template.data.min_current = 6
     data.data.cp_data["cp3"] = cp
+    return b_all
 
-    # execution
+
+@pytest.mark.parametrize(
+    "soc, power, state, ev_current, expected_state, expected_hold, expected_cpl",
+    [
+        pytest.param(90, 800, BatState.BUFFER, 6, BatState.BUFFER, True, 1000,
+                     id="PV zurück, Speicher lädt unter max_soc: Mindeststrom halten"),
+        pytest.param(90, -300, BatState.BUFFER, 6, BatState.BUFFER, True, 700,
+                     id="Speicher entlädt unter max_soc: Mindeststrom halten"),
+        pytest.param(90, 800, BatState.BUFFER, 10, BatState.BUFFER, True, 1000,
+                     id="BUFFER bleibt bestehen, auch wenn Auto über Mindeststrom"),
+        pytest.param(95, 800, BatState.BUFFER, 6, BatState.PRIORITY, False, 800,
+                     id="max_soc erreicht: BUFFER endet, Überlauf wird freigegeben"),
+        pytest.param(85, 800, BatState.BUFFER, 6, BatState.PROTECT, False, -900,
+                     id="min_soc erreicht: PROTECT statt BUFFER"),
+        pytest.param(90, 0, BatState.PRIORITY, 6, BatState.BUFFER, True, 1000,
+                     id="Auto auf Mindeststrom: Eintritt in BUFFER"),
+        pytest.param(90, 0, BatState.PRIORITY, 10, BatState.PRIORITY, False, 0,
+                     id="Auto über Mindeststrom: kein BUFFER"),
+        pytest.param(90, 800, BatState.PROTECT, 6, BatState.PROTECT, False, -900,
+                     id="PROTECT-Latch hält bis max_soc"),
+    ])
+def test_min_soc_state_machine(soc, power, state, ev_current, expected_state, expected_hold, expected_cpl,
+                               data_fixture):
+    b_all = _min_soc_setup(soc, power, state.value, ev_current)
+
     b_all._get_charging_power_left()
 
-    # evaluation
-    assert b_all.data.set.assist_active is expected_assist
+    assert b_all.data.set.state == expected_state.value
     assert b_all.hold_min_current() is expected_hold
+    assert b_all.data.set.charging_power_left == expected_cpl
+
+
+@pytest.mark.parametrize("bat_mode", ["bat_mode", "ev_mode"])
+@pytest.mark.parametrize("state", [BatState.BUFFER, BatState.PROTECT])
+def test_other_bat_modes_reset_state(bat_mode, state, data_fixture):
+    b_all = _min_soc_setup(90, -300, state.value, bat_mode=bat_mode)
+
+    b_all._get_charging_power_left()
+
+    assert b_all.data.set.state == BatState.PRIORITY.value
+    assert b_all.hold_min_current() is False
+    assert b_all.is_protect_state() is False
+
+
+def test_unknown_state_falls_back_to_priority(data_fixture):
+    b_all = _min_soc_setup(90, 0, "gibberish", ev_current=10)
+
+    b_all._get_charging_power_left()
+
+    assert b_all.data.set.state == BatState.PRIORITY.value
+
+
+def test_hold_min_current_requires_fault_free_configured_battery(data_fixture):
+    b_all = _min_soc_setup(90, 0, BatState.BUFFER.value)
+    assert b_all.hold_min_current() is True
+
+    b_all.data.get.fault_state = 2
+    assert b_all.hold_min_current() is False
+
+    b_all.data.get.fault_state = 0
+    b_all.data.config.configured = False
+    assert b_all.hold_min_current() is False
 
 
 def default_chargepoint_factory() -> List[Chargepoint]:

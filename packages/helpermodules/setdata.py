@@ -717,8 +717,6 @@ class SetData:
                 "openWB/set/bat/config/configured" in msg.topic or
                 "openWB/set/bat/get/power_limit_controllable" in msg.topic or
                     "openWB/set/bat/set/regulate_up" in msg.topic or
-                    "openWB/set/bat/set/protect_active" in msg.topic or
-                    "openWB/set/bat/set/assist_active" in msg.topic or
                     "openWB/set/bat/set/hysteresis_discharge" in msg.topic):
                 self._validate_value(msg, bool)
             elif "openWB/set/bat/set/charging_power_left" in msg.topic:
@@ -736,6 +734,7 @@ class SetData:
             elif "openWB/set/bat/get/fault_state" in msg.topic:
                 self._validate_value(msg, int, [(0, 2)])
             elif ("openWB/set/bat/get/fault_str" in msg.topic or
+                  "openWB/set/bat/set/state" in msg.topic or
                   "openWB/set/bat/config/power_limit_mode" in msg.topic):
                 self._validate_value(msg, str)
             elif "/config" in msg.topic:

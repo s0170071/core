@@ -15,18 +15,18 @@ class MinCurrent:
     def __init__(self) -> None:
         pass
 
-    def _assist_floor_active(self, cp) -> bool:
-        """True when ASSIST should pin the EV at min_current (hard floor).
+    def _buffer_floor_active(self, cp) -> bool:
+        """True when the BUFFER state should pin the EV at min_current (hard floor).
 
         Conditions:
-          - MIN_SOC_BAT ASSIST state is latched, AND
+          - MIN_SOC_BAT BUFFER state is active, AND
           - the EV was previously charging (state in CHARGING_STATES and current_prev > 0)
-        In this case the battery's ASSIST budget covers any momentary grid import, so
+        In this case the battery's budget covers any momentary grid import, so
         the loadmanagement stage must not drop the EV to 0 — that would trigger an
         immediate SWITCH_OFF_NOT_CHARGING lockout and a multi-minute outage.
         """
         try:
-            if not data.data.bat_all_data.data.set.assist_active:
+            if not data.data.bat_all_data.hold_min_current():
                 return False
             if cp.data.control_parameter.state not in CHARGING_STATES:
                 return False
@@ -54,16 +54,16 @@ class MinCurrent:
                         current = common.get_current_to_set(
                             cp.data.set.current, available_for_cp, cp.data.set.target_current)
                         if current < cp.data.control_parameter.min_current:
-                            if self._assist_floor_active(cp):
-                                # ASSIST hard floor: allocate min_current anyway, the battery covers any
+                            if self._buffer_floor_active(cp):
+                                # BUFFER hard floor: allocate min_current anyway, the battery covers any
                                 # transient grid import. Without this floor a single tick where loadmanagement
-                                # (or the negative cpl from ASSIST itself) shrinks the allocation below
+                                # (or the negative cpl from BUFFER itself) shrinks the allocation below
                                 # min_current would set 0A, the car would report charge_state=False, and
                                 # PRIORITY's switch_off_check_threshold would immediately lock the LP into
                                 # NO_CHARGING_ALLOWED for the full switch-on delay window.
                                 cp.set_state_and_log(
-                                    "ASSIST aktiv: Mindeststrom wird trotz Lastmanagement-Grenze gehalten, "
-                                    "der Speicher deckt die Differenz.")
+                                    "Speicher-Puffer aktiv: Mindeststrom wird trotz Lastmanagement-Grenze "
+                                    "gehalten, der Speicher deckt die Differenz.")
                                 common.set_current_counterdiff(
                                     cp.data.set.target_current,
                                     cp.data.control_parameter.min_current,

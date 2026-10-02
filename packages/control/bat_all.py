@@ -20,7 +20,7 @@ Je nach Speicher 1-4 Sekunden.
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from control.algorithm.chargemodes import CONSIDERED_CHARGE_MODES_CHARGING
 from control.algorithm.filter_chargepoints import get_chargepoints_with_required_current_by_chargemode
@@ -41,6 +41,40 @@ class BatPowerLimitMode(Enum):
     NO_LIMIT = "no_limit"
     LIMIT_STOP = "limit_stop"
     LIMIT_TO_HOME_CONSUMPTION = "limit_to_home_consumption"
+
+
+class BatState(Enum):
+    """State of the min_soc_bat_mode state machine."""
+    # Battery has priority on surplus, the car is controlled normally.
+    PRIORITY = "priority"
+    # Car sits at min_current while min_soc < soc < max_soc: the battery covers the deficit and recovers
+    # to max_soc before the car is released.
+    BUFFER = "buffer"
+    # soc <= min_soc: latched until max_soc is reached again.
+    PROTECT = "protect"
+
+
+def next_bat_state(state: BatState,
+                   soc: float,
+                   min_soc: float,
+                   max_soc: float,
+                   any_ev_charging: Callable[[], bool],
+                   ev_at_min_current: Callable[[], bool]) -> BatState:
+    """Transition function of the min_soc_bat_mode state machine.
+
+    The EV predicates are callables so they are only evaluated when the transition depends on them.
+    """
+    if soc <= min_soc:
+        state = BatState.PROTECT
+    if state == BatState.PROTECT:
+        return BatState.PRIORITY if soc >= max_soc else BatState.PROTECT
+    if state == BatState.BUFFER:
+        if soc >= max_soc or not any_ev_charging():
+            return BatState.PRIORITY
+        return BatState.BUFFER
+    if soc < max_soc and ev_at_min_current():
+        return BatState.BUFFER
+    return BatState.PRIORITY
 
 
 @dataclass
@@ -77,8 +111,7 @@ class Set:
     charging_power_left: float = field(default=0, metadata={"topic": "set/charging_power_left"})
     power_limit: Optional[float] = field(default=None, metadata={"topic": "set/power_limit"})
     regulate_up: bool = field(default=False, metadata={"topic": "set/regulate_up"})
-    protect_active: bool = field(default=False, metadata={"topic": "set/protect_active"})
-    assist_active: bool = field(default=False, metadata={"topic": "set/assist_active"})
+    state: str = field(default=BatState.PRIORITY.value, metadata={"topic": "set/state"})
 
 
 def set_factory() -> Set:
@@ -202,6 +235,9 @@ class BatAll:
             config = data.data.general_data.data.chargemode_config.pv_charging
 
             self.data.set.regulate_up = False
+            if config.bat_mode != BatConsiderationMode.MIN_SOC_BAT.value:
+                # Stale state must not leak into other modes (min-current floor, phase-switch gating).
+                self.data.set.state = BatState.PRIORITY.value
             if config.bat_mode == BatConsiderationMode.BAT_MODE.value:
                 if self.data.get.power < 0:
                     charging_power_left = self.data.get.power
@@ -220,24 +256,21 @@ class BatAll:
             elif config.bat_mode == BatConsiderationMode.EV_MODE.value:
                 charging_power_left = self.data.get.power
             else:
-                # MIN_SOC_BAT mode — PROTECT / PRIORITY / ASSIST state machine
+                # MIN_SOC_BAT mode — PRIORITY / BUFFER / PROTECT state machine
                 min_soc = config.min_bat_soc
                 max_soc = config.max_bat_soc
                 discharge_rate = config.bat_power_discharge if config.bat_power_discharge_active else 0
                 power = self.data.get.power
                 soc = self.data.get.soc
 
-                # Hysteresis latch: PROTECT until max reached
-                if soc <= min_soc:
-                    self.data.set.protect_active = True
-                    self.data.set.assist_active = False
-                if self.data.set.protect_active and soc >= max_soc:
-                    self.data.set.protect_active = False
-                # Battery recovered to max_soc: end ASSIST (and with it the min-current hold).
-                if self.data.set.assist_active and soc >= max_soc:
-                    self.data.set.assist_active = False
+                previous_state = self._get_state()
+                state = next_bat_state(previous_state, soc, min_soc, max_soc,
+                                       self._any_ev_charging, self._ev_at_min_current)
+                self.data.set.state = state.value
+                if state != previous_state:
+                    log.info(f"MIN_SOC_BAT {previous_state.name}→{state.name}: soc={soc}%, power={power}W")
 
-                if self.data.set.protect_active:
+                if state == BatState.PROTECT:
                     # STATE: PROTECT — soc <= min_soc, battery takes priority.
                     # When discharging: expose discharge power as negative cpl so the algorithm
                     # reduces EV charging and the battery stops draining.
@@ -258,27 +291,11 @@ class BatAll:
                     log.debug(f"MIN_SOC_BAT PROTECT: soc={soc}%, power={power}W, "
                               f"cpl={charging_power_left}W, regulate_up={self.data.set.regulate_up}")
 
-                elif self.data.set.assist_active:
-                    # STATE: ASSIST (latched) — battery helps car
-                    if not self._any_ev_charging():
-                        # Car stopped → exit ASSIST → PRIORITY
-                        self.data.set.assist_active = False
-                        if power < 0:
-                            charging_power_left = power
-                            self.data.set.regulate_up = True
-                        else:
-                            charging_power_left = 0
-                        log.debug(f"MIN_SOC_BAT ASSIST→PRIORITY: car stopped, cpl={charging_power_left}W")
-                    else:
-                        charging_power_left = discharge_rate + min(0, power)
-                        log.debug(f"MIN_SOC_BAT ASSIST: discharge_rate={discharge_rate}W, "
-                                  f"power={power}W, cpl={charging_power_left}W")
-
-                elif soc < max_soc and self._ev_at_min_current():
-                    # Entering ASSIST — car at min, min < soc < max
-                    self.data.set.assist_active = True
+                elif state == BatState.BUFFER:
+                    # STATE: BUFFER — car held at min_current, battery covers the deficit up to discharge_rate
+                    # and recovers to max_soc before the car is released.
                     charging_power_left = discharge_rate + min(0, power)
-                    log.debug(f"MIN_SOC_BAT ASSIST (enter): discharge_rate={discharge_rate}W, "
+                    log.debug(f"MIN_SOC_BAT BUFFER: discharge_rate={discharge_rate}W, "
                               f"power={power}W, cpl={charging_power_left}W")
 
                 else:
@@ -313,13 +330,22 @@ class BatAll:
                 return True
         return False
 
+    def _get_state(self) -> BatState:
+        try:
+            return BatState(self.data.set.state)
+        except ValueError:
+            return BatState.PRIORITY
+
+    def is_protect_state(self) -> bool:
+        return self._get_state() == BatState.PROTECT
+
     def hold_min_current(self) -> bool:
-        """True while the battery recovers after ASSIST: PV charging must not exceed min_current until max_soc."""
-        if not (self.data.config.configured and self.data.get.fault_state == 0 and self.data.set.assist_active):
+        """True in BUFFER: PV charging must stay at min_current until the battery has recovered to max_soc."""
+        if not (self.data.config.configured and self.data.get.fault_state == 0):
             return False
         pv_config = data.data.general_data.data.chargemode_config.pv_charging
         return (pv_config.bat_mode == BatConsiderationMode.MIN_SOC_BAT.value and
-                self.data.get.soc < pv_config.max_bat_soc)
+                self._get_state() == BatState.BUFFER)
 
     def _ev_at_min_current(self) -> bool:
         """True when at least one EV is charging AND all charging EVs are at their min_current."""
