@@ -2,6 +2,7 @@ from modules.common.store._inverter import PurgeInverterState
 from modules.common.component_state import InverterState
 from control.counter_all import CounterAll
 from control.bat import Bat, BatData, Get
+from helpermodules.pv_export_offset import get_pv_export_offset
 from typing import List, NamedTuple
 from unittest.mock import Mock
 
@@ -80,3 +81,24 @@ def test_filter_peaks(params):
     # evaluation
     assert result_state.power == params.expected_power
     assert result_state.exported == 1000  # exported sollte unverändert bleiben
+
+
+def test_update_applies_configured_pv_export_offset(monkeypatch):
+    data.data.counter_all_data.data.get.hierarchy = [
+        {"id": 13, "type": "inverter", "children": []}
+    ]
+    data.data.pv_data = {"pv13": Mock(data=Mock(config=Mock(max_ac_out=0)))}
+    delegate = Mock(delegate=Mock(num=13, state=InverterState(power=-500, exported=57906298)))
+    purge = PurgeInverterState(delegate=delegate)
+    monkeypatch.setattr("modules.common.store._inverter.get_pv_export_offset", lambda module_num: 53804741.475)
+
+    purge.update()
+
+    adjusted_state = delegate.set.call_args.args[0]
+    assert adjusted_state.power == -500
+    assert adjusted_state.exported == 4101556.525
+
+
+def test_configured_pv_export_offset_is_module_specific():
+    assert get_pv_export_offset(13) == 53804741.475
+    assert get_pv_export_offset(11) == 0

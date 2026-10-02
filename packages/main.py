@@ -165,10 +165,12 @@ class HandlerAlgorithm:
                         # latency from device I/O latency entirely.
                         age = loadvars_runner.last_snapshot_age_s()
                         if loadvars_runner.cycle_count() == 0:
+                            # Initialwerte würden per ChangedValuesContext als Änderung veröffentlicht und die
+                            # retained Topics (z.B. Hierarchie, Zählerstände) überschreiben.
                             log.warning(
                                 "handler10Sec: noch kein Snapshot vom "
-                                "LoadvarsRunner verfügbar, nutze "
-                                "Initialwerte aus data.data.")
+                                "LoadvarsRunner verfügbar, Zyklus wird übersprungen.")
+                            return
                         else:
                             log.debug(
                                 "handler10Sec: nutze vorhandenen Snapshot "

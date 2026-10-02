@@ -2,6 +2,7 @@ import logging
 
 from control import data
 from helpermodules import compatibility
+from helpermodules.pv_export_offset import get_pv_export_offset
 from modules.common.component_state import InverterState
 from modules.common.store import ValueStore
 from modules.common.store._api import LoggingValueStore
@@ -52,6 +53,9 @@ class PurgeInverterState:
     def update(self) -> None:
         state = self.filter_peaks(self.delegate.delegate.state)
         state = self.fix_hybrid_values(state)
+        if state.exported is not None:
+            offset = get_pv_export_offset(self.delegate.delegate.num)
+            state.exported = max(0, round(state.exported - offset, 3))
         self.delegate.set(state)
         self.delegate.update()
 
